@@ -1,0 +1,297 @@
+#!/usr/bin/env node
+"use strict";
+
+const http = require("http");
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
+const { URL } = require("url");
+
+const ROUTER_URL = (process.env.LLM_ROUTER_URL || "http://localhost:8080").replace(/\/$/, "");
+
+const CODE_SYSTEM = `You are a concise code assistant. Answer with code first, brief explanation after only if needed. No fluff.`;
+
+function usage() {
+  console.error(`Usage:
+  rllm <prompt>                        one-shot prompt
+  rllm chat                            interactive chat
+  rllm code [files...] [prompt]        code assistant, optionally with files
+  rllm models                          list available models
+
+Options:
+  -m <model>    pick model
+  -s <system>   custom system prompt
+
+Env:
+  LLM_ROUTER_URL   default: http://localhost:8080
+  RLLM_MODEL       pin a model (otherwise picks best available)
+`);
+  process.exit(1);
+}
+
+function paramCount(name) {
+  const m = name.match(/[:\-_](\d+(?:\.\d+)?)b/i) || name.match(/^(\d+(?:\.\d+)?)b/i);
+  return m ? parseFloat(m[1]) : 0;
+}
+
+function parseArgs(argv) {
+  let model = null, system = null;
+  const rest = [];
+  let i = 0;
+  while (i < argv.length) {
+    if ((argv[i] === "-m" || argv[i] === "--model") && argv[i+1]) { model = argv[++i]; }
+    else if ((argv[i] === "-s" || argv[i] === "--system") && argv[i+1]) { system = argv[++i]; }
+    else if (argv[i] === "-h" || argv[i] === "--help") { usage(); }
+    else { rest.push(argv[i]); }
+    i++;
+  }
+  return { model, system, args: rest };
+}
+
+function get(url) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const client = parsed.protocol === "https:" ? https : http;
+    const req = client.request({
+      method: "GET",
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+      path: parsed.pathname,
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function bestModel() {
+  if (process.env.RLLM_MODEL) return process.env.RLLM_MODEL;
+  const data = await get(`${ROUTER_URL}/api/models/all`);
+  const models = data.models || [];
+  if (!models.length) throw new Error("No models available");
+  return models.slice().sort((a, b) => paramCount(b) - paramCount(a))[0];
+}
+
+function streamChat(model, messages, onChunk) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(`${ROUTER_URL}/api/chat`);
+    const client = parsed.protocol === "https:" ? https : http;
+    const body = JSON.stringify({ model, messages, stream: true });
+    const req = client.request({
+      method: "POST",
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+      path: parsed.pathname,
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body) },
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => reject(new Error(`HTTP ${res.statusCode}: ${Buffer.concat(chunks)}`)));
+        return;
+      }
+      let buf = "";
+      res.on("data", (chunk) => {
+        buf += chunk.toString("utf8");
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try { onChunk(JSON.parse(line)); } catch {}
+        }
+      });
+      res.on("end", () => {
+        if (buf.trim()) try { onChunk(JSON.parse(buf)); } catch {}
+        resolve();
+      });
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+const SKIP_DIRS = new Set([".git", "node_modules", ".next", "dist", "build", "__pycache__", ".cache"]);
+const SKIP_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".svg",
+  ".woff", ".woff2", ".ttf", ".eot", ".pdf", ".zip", ".tar", ".gz", ".lock"]);
+
+function collectFiles(target, results = []) {
+  const stat = fs.statSync(target);
+  if (stat.isDirectory()) {
+    for (const entry of fs.readdirSync(target).sort()) {
+      if (SKIP_DIRS.has(entry)) continue;
+      collectFiles(path.join(target, entry), results);
+    }
+  } else {
+    if (!SKIP_EXTS.has(path.extname(target).toLowerCase())) results.push(target);
+  }
+  return results;
+}
+
+function loadFiles(filePaths) {
+  const parts = [];
+  for (const f of filePaths) {
+    for (const file of collectFiles(f)) {
+      try {
+        const content = fs.readFileSync(file, "utf8");
+        const ext = path.extname(file).slice(1) || "";
+        parts.push(`### ${file}\n\`\`\`${ext}\n${content}\n\`\`\``);
+      } catch { /* skip unreadable files */ }
+    }
+  }
+  return parts.join("\n\n");
+}
+
+async function cmdModels() {
+  const data = await get(`${ROUTER_URL}/api/models/all`);
+  const best = (data.models || []).slice().sort((a, b) => paramCount(b) - paramCount(a))[0];
+  for (const backend of data.tier) {
+    const models = data.by_backend[backend] || [];
+    console.log(`\x1b[1m${backend}\x1b[0m (${models.length})`);
+    for (const m of models) console.log(`  ${m}${m === best ? " \x1b[32m← best\x1b[0m" : ""}`);
+  }
+}
+
+async function chat(model, systemPrompt, initialContext) {
+  const readline = require("readline");
+  const history = [];
+  if (systemPrompt) history.push({ role: "system", content: systemPrompt });
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  const ask = (q) => new Promise((r) => rl.question(q, r));
+
+  let pendingContext = initialContext || null; // prepended to first user message
+  if (pendingContext) process.stdout.write("\x1b[2m(files loaded — ask anything)\x1b[0m\n\n");
+
+  console.error(`\x1b[2m${model} — /clear /model <name> /quit\x1b[0m\n`);
+
+  while (true) {
+    let input;
+    try { input = await ask("\x1b[1m>\x1b[0m "); } catch { break; }
+    if (!input.trim()) continue;
+    if (input.trim() === "/quit" || input.trim() === "/exit") break;
+    if (input.trim() === "/clear") {
+      history.length = 0;
+      if (systemPrompt) history.push({ role: "system", content: systemPrompt });
+      console.log("\x1b[2m(context cleared)\x1b[0m\n");
+      continue;
+    }
+    if (input.trim().startsWith("/model ")) {
+      model = input.trim().slice(7).trim();
+      console.log(`\x1b[2m(switched to ${model})\x1b[0m\n`);
+      continue;
+    }
+    if (input.trim().startsWith("/file ")) {
+      const f = input.trim().slice(6).trim();
+      try {
+        const content = loadFiles([f]);
+        history.push({ role: "user", content });
+        console.log(`\x1b[2m(loaded ${f})\x1b[0m\n`);
+      } catch (e) { console.error(`\x1b[31m${e.message}\x1b[0m\n`); }
+      continue;
+    }
+
+    const userContent = pendingContext ? `${pendingContext}\n\n${input}` : input;
+    pendingContext = null;
+    history.push({ role: "user", content: userContent });
+    process.stdout.write("\n");
+    let reply = "";
+    await streamChat(model, history, (chunk) => {
+      const text = chunk.message?.content ?? "";
+      if (text) { process.stdout.write(text); reply += text; }
+    });
+    process.stdout.write("\n\n");
+    if (reply) history.push({ role: "assistant", content: reply });
+  }
+
+  rl.close();
+}
+
+async function main() {
+  const { model: modelFlag, system, args } = parseArgs(process.argv.slice(2));
+
+  if (args[0] === "models") { await cmdModels(); return; }
+
+  const resolvedModel = modelFlag || await bestModel();
+
+  if (args[0] === "chat") {
+    await chat(resolvedModel, system || null, null);
+    return;
+  }
+
+  if (args[0] === "code") {
+    const rest = args.slice(1);
+    // split rest into files (exist on disk) and non-files (prompt words)
+    const files = [], promptWords = [];
+    for (const a of rest) {
+      try { fs.accessSync(a); files.push(a); } catch { promptWords.push(a); }
+    }
+    const prompt = promptWords.join(" ");
+    const context = files.length ? loadFiles(files) : null;
+
+    if (prompt && context) {
+      // one-shot: files + prompt
+      const messages = [
+        { role: "system", content: CODE_SYSTEM },
+        { role: "user", content: `${context}\n\n${prompt}` },
+      ];
+      process.stderr.write(`\x1b[2m[${resolvedModel}]\x1b[0m\n`);
+      let reply = "";
+      await streamChat(resolvedModel, messages, (chunk) => {
+        const text = chunk.message?.content ?? "";
+        if (text) { process.stdout.write(text); reply += text; }
+      });
+      process.stdout.write("\n");
+    } else if (prompt && !context) {
+      // one-shot: just a prompt, no files
+      const messages = [
+        { role: "system", content: CODE_SYSTEM },
+        { role: "user", content: prompt },
+      ];
+      process.stderr.write(`\x1b[2m[${resolvedModel}]\x1b[0m\n`);
+      await streamChat(resolvedModel, messages, (chunk) => {
+        const text = chunk.message?.content ?? "";
+        if (text) process.stdout.write(text);
+      });
+      process.stdout.write("\n");
+    } else {
+      // interactive
+      await chat(resolvedModel, system || CODE_SYSTEM, context);
+    }
+    return;
+  }
+
+  // default: one-shot prompt or stdin
+  const prompt = args.join(" ");
+  if (prompt) {
+    process.stderr.write(`\x1b[2m[${resolvedModel}]\x1b[0m\n`);
+    await streamChat(resolvedModel, [{ role: "user", content: prompt }], (chunk) => {
+      const text = chunk.message?.content ?? "";
+      if (text) process.stdout.write(text);
+    });
+    process.stdout.write("\n");
+    return;
+  }
+
+  if (process.stdin.isTTY) usage();
+  const chunks = [];
+  process.stdin.on("data", (c) => chunks.push(c));
+  process.stdin.on("end", async () => {
+    const p = Buffer.concat(chunks).toString("utf8").trim();
+    if (!p) usage();
+    process.stderr.write(`\x1b[2m[${resolvedModel}]\x1b[0m\n`);
+    await streamChat(resolvedModel, [{ role: "user", content: p }], (chunk) => {
+      const text = chunk.message?.content ?? "";
+      if (text) process.stdout.write(text);
+    });
+    process.stdout.write("\n");
+  });
+}
+
+main().catch((err) => {
+  console.error(`\x1b[31m${err.message}\x1b[0m`);
+  process.exit(1);
+});
