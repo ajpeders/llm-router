@@ -1,0 +1,33 @@
+services:
+  llm-router:
+    container_name: llm-router
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - BACKEND_TIER=${LLM_ROUTER_BACKEND_TIER}
+      - BACKENDS_JSON=${LLM_ROUTER_BACKENDS_JSON}
+      - MODEL_REFRESH_MS=${LLM_ROUTER_MODEL_REFRESH_MS:-30000}
+      - TAGS_TIMEOUT_MS=${LLM_ROUTER_TAGS_TIMEOUT_MS:-4000}
+      - REQUEST_TIMEOUT_MS=${LLM_ROUTER_REQUEST_TIMEOUT_MS:-300000}
+      - MINIMAX_API_KEY=${LLM_ROUTER_MINIMAX_API_KEY:-}
+      - MINIMAX_MODEL=${LLM_ROUTER_MINIMAX_MODEL:-MiniMax-Text-01}
+      - MINIMAX_API_BASE=${LLM_ROUTER_MINIMAX_API_BASE:-https://api.minimax.chat/v1}
+      - MINIMAX_PRIORITY=${LLM_ROUTER_MINIMAX_PRIORITY:-fallback}
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=web
+      - traefik.http.routers.llm-router.rule=Host(`${LLM_ROUTER_DOMAIN}`)
+      - traefik.http.routers.llm-router.entrypoints=websecure
+      - traefik.http.routers.llm-router.tls=true
+      - traefik.http.routers.llm-router.tls.certresolver=letsencrypt
+      - traefik.http.routers.llm-router.middlewares=local-only@file
+      - traefik.http.services.llm-router.loadbalancer.server.port=8080
+    networks:
+      - web
+
+networks:
+  web:
+    external: true
+    name: web
