@@ -24,6 +24,10 @@ node router.js
 | `MODEL_REFRESH_MS` | `30000` | How often to poll backends for models |
 | `TAGS_TIMEOUT_MS` | `4000` | Timeout for model list fetch |
 | `REQUEST_TIMEOUT_MS` | `300000` | Proxy request timeout |
+| `MINIMAX_API_KEY` | *(unset)* | Enables MiniMax cloud backend for `/v1/chat/completions` |
+| `MINIMAX_MODEL` | `MiniMax-Text-01` | Model sent to MiniMax (overrides the request's model) |
+| `MINIMAX_API_BASE` | `https://api.minimax.chat/v1` | MiniMax OpenAI-compatible base URL |
+| `MINIMAX_PRIORITY` | `fallback` | `fallback` (after local) or `primary` (before local) |
 
 **Adding machines:**
 

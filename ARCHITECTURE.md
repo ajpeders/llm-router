@@ -86,11 +86,15 @@ Two CLIs ship alongside it:
   trailing `<number>b` in a model name (e.g. `qwen3:32b`) and picks the
   highest value when no model is pinned via `-m`/`RLLM_MODEL`. It has no
   awareness of actual capability or backend load.
-- **MiniMax env vars are unused.** `docker-compose.yml` and `.env.example`
-  define `LLM_ROUTER_MINIMAX_*` variables and pass them into the container,
-  but `router.js` never reads or acts on any `MINIMAX_*` variable — there is
-  no cloud-provider fallback implemented in code today. Treat these as
-  reserved/aspirational config, not a working feature.
+- **MiniMax is an optional cloud backend, chat-completions only.** Enabled by
+  `MINIMAX_API_KEY`. Only `POST /v1/chat/completions` can go there — MiniMax
+  speaks the OpenAI API, so Ollama-native `/api/*` routes stay local rather
+  than being translated. The request's `model` is rewritten to
+  `MINIMAX_MODEL` and the auth header replaced with the MiniMax key. With
+  `MINIMAX_PRIORITY=fallback` it's tried last, *except* it goes first when no
+  local backend lists the requested model (a local 404 isn't retried, so
+  otherwise it would never be reached) or when `MINIMAX_MODEL` is requested
+  by name. `primary` always tries it first.
 
 ## Deployment
 

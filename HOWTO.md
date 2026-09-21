@@ -42,6 +42,21 @@ Backends not listed are still usable — they're appended after the named
 ones. Priority only matters when a request doesn't specify a model, or when
 none of the tiered backends currently report having the requested model.
 
+## Enable MiniMax cloud fallback
+
+Set the key in `.env` (the other `LLM_ROUTER_MINIMAX_*` vars are optional,
+see `.env.example`) and redeploy:
+
+```bash
+LLM_ROUTER_MINIMAX_API_KEY=your_minimax_key
+LLM_ROUTER_MINIMAX_MODEL=MiniMax-Text-01
+```
+
+Only OpenAI-style `POST /v1/chat/completions` requests are eligible. Confirm
+it's on with `curl http://localhost:8080/health` — the `minimax` field shows
+the model and priority (`null` when disabled). Responses served by MiniMax
+log as `-> minimax`.
+
 ## Deploy with Docker Compose
 
 1. Copy `.env.example` to `.env` and fill in your domain and backends:

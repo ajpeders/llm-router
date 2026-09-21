@@ -61,6 +61,14 @@ if (TIER_ORDER.length === 0) {
   process.exit(1);
 }
 
+// Optional MiniMax cloud backend. Only OpenAI-style chat completions are sent
+// there; Ollama-native /api/* routes stay local.
+const MINIMAX = "minimax";
+const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY || "";
+const MINIMAX_MODEL = process.env.MINIMAX_MODEL || "MiniMax-Text-01";
+const MINIMAX_API_BASE = (process.env.MINIMAX_API_BASE || "https://api.minimax.chat/v1").replace(/\/+$/, "");
+const MINIMAX_PRIORITY = process.env.MINIMAX_PRIORITY === "primary" ? "primary" : "fallback";
+
 const modelSets = {};
 for (const backend of BACKEND_NAMES) modelSets[backend] = new Set();
 
@@ -169,6 +177,40 @@ function orderedBackendsForModel(model) {
   return [...available, ...TIER_ORDER.filter((backend) => !available.includes(backend))];
 }
 
+function minimaxEligible(req) {
+  if (!MINIMAX_API_KEY || req.method !== "POST") return false;
+  return new URL(req.url, "http://router.local").pathname === "/v1/chat/completions";
+}
+
+// MiniMax goes first when it's primary, when the MiniMax model is asked for by
+// name, or when no local backend has the requested model; otherwise it's last.
+function withMinimax(targets, model) {
+  const noLocalModel = model && !BACKEND_NAMES.some((backend) => modelSets[backend].has(model));
+  if (MINIMAX_PRIORITY === "primary" || model === MINIMAX_MODEL || noLocalModel) {
+    return [MINIMAX, ...targets];
+  }
+  return [...targets, MINIMAX];
+}
+
+function upstreamFor(backend, req, body) {
+  if (backend !== MINIMAX) {
+    return { url: new URL(req.url, BACKENDS[backend]), body, auth: null };
+  }
+  let outBody = body;
+  try {
+    const data = JSON.parse(body.toString("utf8"));
+    data.model = MINIMAX_MODEL;
+    outBody = Buffer.from(JSON.stringify(data));
+  } catch {
+    // Forward unparseable bodies as-is and let MiniMax reject them.
+  }
+  return {
+    url: new URL(MINIMAX_API_BASE + req.url.replace(/^\/v1/, "")),
+    body: outBody,
+    auth: `Bearer ${MINIMAX_API_KEY}`,
+  };
+}
+
 function collectBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -184,18 +226,20 @@ function shouldRetryStatus(statusCode) {
 
 function proxyAttempt(req, res, body, backend, isLastAttempt) {
   return new Promise((resolve) => {
-    const targetBase = BACKENDS[backend];
-    const targetUrl = new URL(req.url, targetBase);
+    const upstream = upstreamFor(backend, req, body);
+    const targetUrl = upstream.url;
+    const outBody = upstream.body;
     const isHttps = targetUrl.protocol === "https:";
     const client = isHttps ? https : http;
 
     const headers = { ...req.headers };
     delete headers.host;
-    if (body.length > 0) {
-      headers["content-length"] = String(body.length);
+    if (outBody.length > 0) {
+      headers["content-length"] = String(outBody.length);
     } else {
       delete headers["content-length"];
     }
+    if (upstream.auth) headers.authorization = upstream.auth;
     headers["x-llm-router-backend"] = backend;
 
     const options = {
@@ -237,7 +281,7 @@ function proxyAttempt(req, res, body, backend, isLastAttempt) {
       }
     });
 
-    if (body.length > 0) upstreamReq.write(body);
+    if (outBody.length > 0) upstreamReq.write(outBody);
     upstreamReq.end();
   });
 }
@@ -253,7 +297,8 @@ const server = http.createServer(async (req, res) => {
     const snapshot = {};
     for (const name of BACKEND_NAMES) snapshot[name] = modelSets[name].size;
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, tier: TIER_ORDER, backends: snapshot }));
+    const minimax = MINIMAX_API_KEY ? { model: MINIMAX_MODEL, priority: MINIMAX_PRIORITY } : null;
+    res.end(JSON.stringify({ ok: true, tier: TIER_ORDER, backends: snapshot, minimax }));
     return;
   }
 
@@ -266,7 +311,8 @@ const server = http.createServer(async (req, res) => {
   try {
     const body = await collectBody(req);
     const model = getRequestedModel(req, body);
-    const targets = orderedBackendsForModel(model);
+    const localTargets = orderedBackendsForModel(model);
+    const targets = minimaxEligible(req) ? withMinimax(localTargets, model) : localTargets;
 
     for (let i = 0; i < targets.length; i += 1) {
       const backend = targets[i];
@@ -291,6 +337,7 @@ server.listen(PORT, "0.0.0.0", async () => {
   log(`starting on :${PORT}`);
   log(`tier order: ${JSON.stringify(TIER_ORDER)}`);
   log(`backends: ${JSON.stringify(BACKENDS)}`);
+  log(MINIMAX_API_KEY ? `minimax: ${MINIMAX_MODEL} (${MINIMAX_PRIORITY}) via ${MINIMAX_API_BASE}` : "minimax: disabled");
   await refreshModels();
   setInterval(refreshModels, MODEL_REFRESH_MS);
 });
