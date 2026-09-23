@@ -3,11 +3,13 @@
 const http = require("http");
 const https = require("https");
 const { URL } = require("url");
+const { createIdleTracker } = require("./idle");
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const MODEL_REFRESH_MS = parseInt(process.env.MODEL_REFRESH_MS || "30000", 10);
 const TAGS_TIMEOUT_MS = parseInt(process.env.TAGS_TIMEOUT_MS || "4000", 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "300000", 10);
+const IDLE_WINDOW_MS = parseInt(process.env.IDLE_WINDOW_MS || "120000", 10);
 const BACKEND_TIER = (process.env.BACKEND_TIER || "mac,arch")
   .split(",")
   .map((s) => s.trim())
@@ -75,6 +77,8 @@ for (const backend of BACKEND_NAMES) modelSets[backend] = new Set();
 function log(message) {
   console.log(`[llm-router] ${message}`);
 }
+
+const idleTracker = createIdleTracker(IDLE_WINDOW_MS);
 
 async function fetchJson(url, timeoutMs) {
   const controller = new AbortController();
@@ -308,6 +312,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.url === "/idle") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(idleTracker.snapshot(Date.now())));
+    return;
+  }
+
+  const isBatch = req.headers["x-llm-router-batch"] === "1";
+  if (!isBatch) {
+    idleTracker.begin();
+    idleTracker.markActivity(Date.now());
+  }
   try {
     const body = await collectBody(req);
     const model = getRequestedModel(req, body);
@@ -330,11 +345,13 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "router_error", detail: err.message }));
     }
+  } finally {
+    if (!isBatch) idleTracker.end();
   }
 });
 
 server.listen(PORT, "0.0.0.0", async () => {
-  log(`starting on :${PORT}`);
+  log(`starting on :${server.address().port}`);
   log(`tier order: ${JSON.stringify(TIER_ORDER)}`);
   log(`backends: ${JSON.stringify(BACKENDS)}`);
   log(MINIMAX_API_KEY ? `minimax: ${MINIMAX_MODEL} (${MINIMAX_PRIORITY}) via ${MINIMAX_API_BASE}` : "minimax: disabled");

@@ -28,6 +28,7 @@ node router.js
 | `MINIMAX_MODEL` | `MiniMax-Text-01` | Model sent to MiniMax (overrides the request's model) |
 | `MINIMAX_API_BASE` | `https://api.minimax.chat/v1` | MiniMax OpenAI-compatible base URL |
 | `MINIMAX_PRIORITY` | `fallback` | `fallback` (after local) or `primary` (before local) |
+| `IDLE_WINDOW_MS` | `120000` | Quiet window (ms) with no real requests before `/idle` reports idle |
 
 **Adding machines:**
 
@@ -92,6 +93,14 @@ OLLAMA_HOST=http://localhost:8080 ollama run qwen3:8b
 ```
 
 Responses include an `x-llm-router-backend` header indicating which machine handled the request.
+
+### Idle endpoint
+
+```bash
+curl http://localhost:8080/idle
+```
+
+Returns `{ idle, inFlight, idleSeconds, quietWindowMs }`, reflecting whether the router has had no real requests in flight or received recently within `IDLE_WINDOW_MS`. Requests sent with header `x-llm-router-batch: 1` are excluded from idle tracking, so a batch-job consumer polling its own traffic doesn't mask true idleness.
 
 ---
 

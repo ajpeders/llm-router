@@ -46,8 +46,19 @@ Two CLIs ship alongside it:
    in the list, it retries the next backend. The final attempt returns
    whatever that backend gives (success, error status, or a synthesized
    `502 all_backends_failed`) regardless of status code.
-6. `GET /health` and `GET /api/models/all` (alias `/models/all`) are handled
-   directly by the router and never proxied.
+6. `GET /health`, `GET /api/models/all` (alias `/models/all`), and `GET /idle`
+   are handled directly by the router and never proxied.
+
+## Idle tracking
+
+The router tracks how many proxied requests are currently in flight and the
+timestamp of the last "real" request, via `createIdleTracker` (`idle.js`).
+`GET /idle` reports `{ idle, inFlight, idleSeconds, quietWindowMs }`, where
+`idle` is true once `inFlight` is zero and the quiet period exceeds
+`IDLE_WINDOW_MS`. Requests carrying the header `x-llm-router-batch: 1` are
+excluded from this tracking (no `begin`/`markActivity` calls), so that an
+idle-triggered batch-job consumer's own traffic through the router doesn't
+mask true idleness.
 
 ## Model discovery
 
