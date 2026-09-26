@@ -69,7 +69,8 @@ function request(url, options = {}) {
   });
 }
 
-function requestStream(url, options = {}, onChunk) {
+// Parses an OpenAI-style SSE stream (lines "data: {json}", terminated by "data: [DONE]").
+function requestSSE(url, options = {}, onChunk) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const client = parsed.protocol === "https:" ? https : http;
@@ -93,17 +94,14 @@ function requestStream(url, options = {}, onChunk) {
         const lines = buf.split("\n");
         buf = lines.pop();
         for (const line of lines) {
-          if (line.trim()) {
-            try { onChunk(JSON.parse(line)); } catch { /* skip non-JSON */ }
-          }
+          const t = line.trim();
+          if (!t.startsWith("data:")) continue;
+          const data = t.slice(5).trim();
+          if (data === "[DONE]") continue;
+          try { onChunk(JSON.parse(data)); } catch { /* skip non-JSON */ }
         }
       });
-      res.on("end", () => {
-        if (buf.trim()) {
-          try { onChunk(JSON.parse(buf)); } catch { /* skip */ }
-        }
-        resolve();
-      });
+      res.on("end", resolve);
     });
     req.on("error", reject);
     if (options.body) req.write(options.body);
@@ -160,25 +158,27 @@ async function cmdRun(router, args) {
     process.exit(1);
   }
   const prompt = rest.join(" ");
-  const payload = JSON.stringify({ model, prompt, stream: !args.noStream });
+  const messages = [{ role: "user", content: prompt }];
+  const payload = JSON.stringify({ model, messages, stream: !args.noStream });
 
   if (args.noStream) {
-    const res = await request(`${router}/api/generate`, {
+    const res = await request(`${router}/v1/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
       body: payload,
     });
     const data = JSON.parse(res.body);
-    console.log(data.response ?? JSON.stringify(data, null, 2));
+    console.log(data.choices?.[0]?.message?.content ?? JSON.stringify(data, null, 2));
     return;
   }
 
   process.stdout.write("");
-  await requestStream(
-    `${router}/api/generate`,
+  await requestSSE(
+    `${router}/v1/chat/completions`,
     { headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) }, body: payload },
     (chunk) => {
-      if (typeof chunk.response === "string") process.stdout.write(chunk.response);
+      const text = chunk.choices?.[0]?.delta?.content;
+      if (typeof text === "string") process.stdout.write(text);
     }
   );
   process.stdout.write("\n");
@@ -209,11 +209,11 @@ async function cmdChat(router, args) {
     process.stdout.write("\x1b[1mAssistant:\x1b[0m ");
     let assistantContent = "";
     try {
-      await requestStream(
-        `${router}/api/chat`,
+      await requestSSE(
+        `${router}/v1/chat/completions`,
         { headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) }, body: payload },
         (chunk) => {
-          const text = chunk.message?.content ?? "";
+          const text = chunk.choices?.[0]?.delta?.content ?? "";
           if (text) { process.stdout.write(text); assistantContent += text; }
         }
       );

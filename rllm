@@ -75,9 +75,10 @@ async function bestModel() {
   return models.slice().sort((a, b) => paramCount(b) - paramCount(a))[0];
 }
 
+// Parses an OpenAI-style SSE stream (lines "data: {json}", terminated by "data: [DONE]").
 function streamChat(model, messages, onChunk) {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(`${ROUTER_URL}/api/chat`);
+    const parsed = new URL(`${ROUTER_URL}/v1/chat/completions`);
     const client = parsed.protocol === "https:" ? https : http;
     const body = JSON.stringify({ model, messages, stream: true });
     const req = client.request({
@@ -99,14 +100,14 @@ function streamChat(model, messages, onChunk) {
         const lines = buf.split("\n");
         buf = lines.pop();
         for (const line of lines) {
-          if (!line.trim()) continue;
-          try { onChunk(JSON.parse(line)); } catch {}
+          const t = line.trim();
+          if (!t.startsWith("data:")) continue;
+          const data = t.slice(5).trim();
+          if (data === "[DONE]") continue;
+          try { onChunk(JSON.parse(data)); } catch {}
         }
       });
-      res.on("end", () => {
-        if (buf.trim()) try { onChunk(JSON.parse(buf)); } catch {}
-        resolve();
-      });
+      res.on("end", resolve);
     });
     req.on("error", reject);
     req.write(body);
@@ -200,7 +201,7 @@ async function chat(model, systemPrompt, initialContext) {
     process.stdout.write("\n");
     let reply = "";
     await streamChat(model, history, (chunk) => {
-      const text = chunk.message?.content ?? "";
+      const text = chunk.choices?.[0]?.delta?.content ?? "";
       if (text) { process.stdout.write(text); reply += text; }
     });
     process.stdout.write("\n\n");
@@ -241,7 +242,7 @@ async function main() {
       process.stderr.write(`\x1b[2m[${resolvedModel}]\x1b[0m\n`);
       let reply = "";
       await streamChat(resolvedModel, messages, (chunk) => {
-        const text = chunk.message?.content ?? "";
+        const text = chunk.choices?.[0]?.delta?.content ?? "";
         if (text) { process.stdout.write(text); reply += text; }
       });
       process.stdout.write("\n");
@@ -253,7 +254,7 @@ async function main() {
       ];
       process.stderr.write(`\x1b[2m[${resolvedModel}]\x1b[0m\n`);
       await streamChat(resolvedModel, messages, (chunk) => {
-        const text = chunk.message?.content ?? "";
+        const text = chunk.choices?.[0]?.delta?.content ?? "";
         if (text) process.stdout.write(text);
       });
       process.stdout.write("\n");
@@ -269,7 +270,7 @@ async function main() {
   if (prompt) {
     process.stderr.write(`\x1b[2m[${resolvedModel}]\x1b[0m\n`);
     await streamChat(resolvedModel, [{ role: "user", content: prompt }], (chunk) => {
-      const text = chunk.message?.content ?? "";
+      const text = chunk.choices?.[0]?.delta?.content ?? "";
       if (text) process.stdout.write(text);
     });
     process.stdout.write("\n");
@@ -284,7 +285,7 @@ async function main() {
     if (!p) usage();
     process.stderr.write(`\x1b[2m[${resolvedModel}]\x1b[0m\n`);
     await streamChat(resolvedModel, [{ role: "user", content: p }], (chunk) => {
-      const text = chunk.message?.content ?? "";
+      const text = chunk.choices?.[0]?.delta?.content ?? "";
       if (text) process.stdout.write(text);
     });
     process.stdout.write("\n");
