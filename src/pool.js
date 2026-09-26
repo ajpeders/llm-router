@@ -1,0 +1,69 @@
+"use strict";
+
+class Pool {
+  constructor(names, defaultSlots, now = Date.now) {
+    this.defaultSlots = defaultSlots;
+    this.now = now;
+    this.backends = new Map(
+      names.map((name) => [
+        name,
+        { name, up: false, fails: 0, downSince: now(), models: new Set(), loaded: null, slots: new Map(), inflight: new Map() },
+      ])
+    );
+  }
+
+  applyPoll(name, { models, loaded, slots }) {
+    const b = this.backends.get(name);
+    b.up = true;
+    b.fails = 0;
+    b.downSince = null;
+    b.models = new Set(models);
+    b.loaded = loaded === null ? null : new Set(loaded);
+    b.slots = new Map(Object.entries(slots));
+  }
+
+  applyFailure(name, downAfter) {
+    const b = this.backends.get(name);
+    b.fails += 1;
+    if (b.fails >= downAfter && b.up) {
+      b.up = false;
+      b.downSince = this.now();
+    }
+  }
+
+  capacity(b, model) { return b.slots.get(model) ?? this.defaultSlots; }
+  inflight(b, model) { return b.inflight.get(model) ?? 0; }
+  totalInflight(b) { let n = 0; for (const v of b.inflight.values()) n += v; return n; }
+  isLoaded(b, model) { return b.loaded === null || b.loaded.has(model); }
+
+  acquire(name, model) {
+    const b = this.backends.get(name);
+    b.inflight.set(model, this.inflight(b, model) + 1);
+  }
+
+  release(name, model) {
+    const b = this.backends.get(name);
+    const n = this.inflight(b, model) - 1;
+    if (n > 0) b.inflight.set(model, n); else b.inflight.delete(model);
+  }
+
+  allModels() {
+    const all = new Set();
+    for (const b of this.backends.values()) if (b.up) for (const m of b.models) all.add(m);
+    return [...all].sort();
+  }
+
+  snapshot() {
+    return [...this.backends.values()].map((b) => ({
+      name: b.name,
+      up: b.up,
+      down_since: b.downSince,
+      models: [...b.models].sort(),
+      loaded: b.loaded === null ? null : [...b.loaded].sort(),
+      slots: Object.fromEntries(b.slots),
+      inflight: Object.fromEntries(b.inflight),
+    }));
+  }
+}
+
+module.exports = { Pool };
