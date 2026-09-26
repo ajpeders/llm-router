@@ -24,10 +24,14 @@ test("interleaved jobs for two models load each model once", async () => {
   const queue = new Queue(":memory:");
   for (const m of ["A", "B", "A", "B", "A", "B"]) queue.submit({ model: m, request: { messages: [] } }, 0);
 
+  // Track loads independently of pool.backends.*.loaded: since the pool.acquire fix,
+  // the pool itself now marks `loaded` as the just-acquired model on every acquire
+  // (a swap is in progress on any backend that didn't already report it loaded), so
+  // reading b.loaded here would always see the model we're about to run.
   const loads = [];
-  const runJob = async (job, backend) => {
-    const b = pool.backends.get(backend);
-    if (!b.loaded.has(job.model)) { loads.push(job.model); b.loaded = new Set([job.model]); }
+  let currentlyLoaded = null;
+  const runJob = async (job) => {
+    if (currentlyLoaded !== job.model) { loads.push(job.model); currentlyLoaded = job.model; }
     await new Promise((r) => setTimeout(r, 5));
     return { ok: job.model };
   };

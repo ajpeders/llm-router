@@ -38,6 +38,11 @@ class Pool {
 
   acquire(name, model) {
     const b = this.backends.get(name);
+    // A llama-swap backend that doesn't yet report `model` as loaded is mid-swap: this
+    // acquire is what triggers the load. Mark it loaded now so a second tryAcquire for
+    // the previously-resident model doesn't race the swap before the next poll corrects
+    // the picture — llama-swap can only serve one resident model at a time.
+    if (b.loaded !== null && !b.loaded.has(model)) b.loaded = new Set([model]);
     b.inflight.set(model, this.inflight(b, model) + 1);
   }
 
