@@ -74,7 +74,16 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now }) {
         try {
           backend = await leaser.acquire(model, "interactive", cfg.waitTimeoutMs);
         } catch (err) {
-          if (err.message === "no_backend") return send(res, 404, { error: "unknown_model", model });
+          if (err.message === "no_backend") {
+            // "No up backend serves it" is ambiguous between "this model doesn't
+            // exist" and "its backend is just down right now" (or we haven't polled
+            // anyone yet). Only call it unknown once we've polled at least once and
+            // no backend has ever reported this model.
+            if (!pool.polledOnce || pool.knownModels.has(model)) {
+              return send(res, 503, { error: "backend_down", model });
+            }
+            return send(res, 404, { error: "unknown_model", model });
+          }
           return send(res, 503, { error: "busy", detail: err.message });
         }
         // req.destroyed is not a useful signal here: an IncomingMessage auto-destroys

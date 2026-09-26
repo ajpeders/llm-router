@@ -55,6 +55,37 @@ test("jobs API and status", async () => {
   s.close();
 });
 
+test("known model with a down backend is 503, not 404; never-seen model is 404; pre-poll is 503", async () => {
+  const cfg = { backends: { luna: "http://127.0.0.1:1" }, waitTimeoutMs: 50, firstByteTimeoutMs: 1000, idleTimeoutMs: 1000 };
+  const pool = new Pool(["luna"], 2);
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  const server = createServer({ cfg, pool, leaser, queue, drainer: { current: null }, now: () => 1000 });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  // Before the first poll, polledOnce is false: anything must be 503, not 404 — the
+  // model could well exist, we just haven't asked any backend yet.
+  const preFirstPoll = await post(`${base}/v1/chat/completions`, { model: "m" });
+  assert.strictEqual(preFirstPoll.status, 503);
+  assert.deepStrictEqual(await preFirstPoll.json(), { error: "backend_down", model: "m" });
+
+  // Now poll once (model "m" seen), then take the backend down.
+  pool.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 2 } });
+  for (let i = 0; i < 3; i++) pool.applyFailure("luna", 3);
+  assert.strictEqual(pool.backends.get("luna").up, false);
+
+  const seenButDown = await post(`${base}/v1/chat/completions`, { model: "m" });
+  assert.strictEqual(seenButDown.status, 503);
+  assert.deepStrictEqual(await seenButDown.json(), { error: "backend_down", model: "m" });
+
+  const neverSeen = await post(`${base}/v1/chat/completions`, { model: "nope" });
+  assert.strictEqual(neverSeen.status, 404);
+  assert.deepStrictEqual(await neverSeen.json(), { error: "unknown_model", model: "nope" });
+
+  server.close();
+});
+
 test("/health and /api/models/all carry tier for the CLIs", async () => {
   const s = await setup();
   const health = await (await fetch(`${s.base}/health`)).json();

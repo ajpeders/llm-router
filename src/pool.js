@@ -4,6 +4,11 @@ class Pool {
   constructor(names, defaultSlots, now = Date.now) {
     this.defaultSlots = defaultSlots;
     this.now = now;
+    // Union of every model any backend has ever reported, plus whether any backend has
+    // been polled (successfully or not) at all yet — used to tell "model doesn't exist"
+    // apart from "its backend is down right now" / "we haven't asked anyone yet".
+    this.knownModels = new Set();
+    this.polledOnce = false;
     this.backends = new Map(
       names.map((name) => [
         name,
@@ -18,8 +23,10 @@ class Pool {
     b.fails = 0;
     b.downSince = null;
     b.models = new Set(models);
+    for (const m of models) this.knownModels.add(m);
     b.loaded = loaded === null ? null : new Set(loaded);
     b.slots = new Map(Object.entries(slots));
+    this.polledOnce = true;
   }
 
   applyFailure(name, downAfter) {
@@ -29,6 +36,7 @@ class Pool {
       b.up = false;
       b.downSince = this.now();
     }
+    this.polledOnce = true;
   }
 
   capacity(b, model) { return b.slots.get(model) ?? this.defaultSlots; }
