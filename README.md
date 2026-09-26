@@ -28,7 +28,8 @@ node router.js
 | `POLL_MS` | `10000` | Backend poll interval |
 | `POLL_TIMEOUT_MS` | `4000` | Per-poll timeout |
 | `DOWN_AFTER_FAILS` | `3` | Consecutive failed polls before a backend is marked down |
-| `FIRST_BYTE_TIMEOUT_MS` | `120000` | Interactive-lane timeout waiting for the first response byte |
+| `FIRST_BYTE_TIMEOUT_MS` | `120000` | Interactive-lane timeout waiting for the first response byte (streaming requests only) |
+| `NONSTREAM_TIMEOUT_MS` | `1800000` | Interactive-lane timeout for a request with `stream != true` — its headers only arrive once generation is fully done, so it needs the same long cap as a batch job |
 | `IDLE_TIMEOUT_MS` | `60000` | Stream idle timeout (interactive and batch) |
 | `IDLE_WINDOW_MS` | `120000` | Quiet window with no real requests before `/idle` reports idle |
 | `BATCH_TIMEOUT_MS` | `1800000` | Total cap for a batch job's run (non-streaming, so this is the real ceiling) |

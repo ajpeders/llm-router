@@ -15,7 +15,7 @@ async function setup() {
     });
   });
   await new Promise((r) => backend.listen(0, "127.0.0.1", r));
-  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 200, firstByteTimeoutMs: 1000, idleTimeoutMs: 1000, idleWindowMs: 50 };
+  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 200, firstByteTimeoutMs: 1000, nonStreamTimeoutMs: 1000, idleTimeoutMs: 1000, idleWindowMs: 50 };
   const pool = new Pool(["luna"], 2);
   pool.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 2 } });
   const leaser = new Leaser(pool);
@@ -173,7 +173,7 @@ test("/idle: idle when quiet, not idle in flight, batch-tagged excluded, idle re
     });
   });
   await new Promise((r) => backend.listen(0, "127.0.0.1", r));
-  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 1000, firstByteTimeoutMs: 5000, idleTimeoutMs: 5000, idleWindowMs: 50 };
+  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 1000, firstByteTimeoutMs: 5000, nonStreamTimeoutMs: 5000, idleTimeoutMs: 5000, idleWindowMs: 50 };
   const pool = new Pool(["luna"], 2);
   pool.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 2 } });
   const leaser = new Leaser(pool);
@@ -223,6 +223,55 @@ test("/idle: idle when quiet, not idle in flight, batch-tagged excluded, idle re
 
   server.close();
   backend.close();
+});
+
+test("non-streaming request outlives firstByteTimeoutMs by using nonStreamTimeoutMs; streaming still 504s", async () => {
+  // A backend that only sends headers after a delay longer than firstByteTimeoutMs
+  // but shorter than nonStreamTimeoutMs — simulating a slow non-streaming generation.
+  const DELAY_MS = 150;
+  const backend = http.createServer((req, res) => {
+    let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => {
+      setTimeout(() => {
+        // The streaming case below deliberately has the client (router->backend leg)
+        // give up before this fires, which destroys this socket first — guard the
+        // write so that doesn't throw and leave a dangling handle.
+        if (res.writableEnded || res.destroyed) return;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ served: JSON.parse(b).model }));
+      }, DELAY_MS);
+    });
+  });
+  await new Promise((r) => backend.listen(0, "127.0.0.1", r));
+  const cfg = {
+    backends: { luna: `http://127.0.0.1:${backend.address().port}` },
+    waitTimeoutMs: 1000,
+    firstByteTimeoutMs: 50,
+    nonStreamTimeoutMs: 1000,
+    idleTimeoutMs: 1000,
+  };
+  const pool = new Pool(["luna"], 2);
+  pool.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 2 } });
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  const server = createServer({ cfg, pool, leaser, queue, drainer: { current: null }, now: () => 1000 });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  // Non-streaming (no stream:true) survives the slow backend under nonStreamTimeoutMs.
+  const nonStreaming = await post(`${base}/v1/chat/completions`, { model: "m" });
+  assert.strictEqual(nonStreaming.status, 200);
+  assert.deepStrictEqual(await nonStreaming.json(), { served: "m" });
+
+  // Streaming still uses the short firstByteTimeoutMs and 504s against the same delay.
+  const streaming = await post(`${base}/v1/chat/completions`, { model: "m", stream: true });
+  assert.strictEqual(streaming.status, 504);
+  assert.deepStrictEqual(await streaming.json(), { error: "upstream_timeout", detail: "upstream_timeout" });
+
+  // The aborted streaming leg leaves a dead socket open on the backend that never
+  // gets a 'close' from the client side — closeAllConnections forces it, same
+  // pattern as upstream.test.js's "no first byte -> 504" case.
+  server.closeAllConnections(); server.close();
+  backend.closeAllConnections(); backend.close();
 });
 
 test("a malformed request target (\"//\") is handled, not an unhandled rejection", async () => {

@@ -26,6 +26,11 @@ function loadConfig(env = process.env) {
     defaultSlots: int(env, "DEFAULT_SLOTS", 2),
     firstByteTimeoutMs: int(env, "FIRST_BYTE_TIMEOUT_MS", 120000),
     idleTimeoutMs: int(env, "IDLE_TIMEOUT_MS", 60000),
+    // A non-streaming /v1 request gets no response headers from llama-server
+    // until generation is fully done, so the interactive firstByteTimeoutMs
+    // (tuned for a streaming first token) is the wrong cap for it. Use the
+    // same long cap batch jobs use, for the same reason.
+    nonStreamTimeoutMs: int(env, "NONSTREAM_TIMEOUT_MS", 30 * 60000),
     // Quiet window /idle uses to decide the router itself is idle (no in-flight
     // interactive request and no activity for at least this long).
     idleWindowMs: int(env, "IDLE_WINDOW_MS", 120000),

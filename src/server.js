@@ -84,8 +84,15 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now }) {
         }
         try {
           const body = await readBody(req);
-          const model = parseJson(body)?.model;
+          const parsedBody = parseJson(body);
+          const model = parsedBody?.model;
           if (typeof model !== "string") return send(res, 400, { error: "missing_model" });
+          // Non-streaming requests get no headers from llama-server until generation
+          // is fully done, so the interactive first-byte timeout (tuned for a
+          // streaming response's first token) is the wrong cap here — use the same
+          // long cap batch jobs use for exactly this reason (see cfg.batchTimeoutMs).
+          const isStreaming = parsedBody?.stream === true;
+          const firstByteTimeoutMs = isStreaming ? cfg.firstByteTimeoutMs : cfg.nonStreamTimeoutMs;
           let backend;
           try {
             backend = await leaser.acquire(model, "interactive", cfg.waitTimeoutMs);
@@ -111,7 +118,7 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now }) {
             return;
           }
           try {
-            await proxyStream({ req, res, body, baseUrl: cfg.backends[backend], firstByteTimeoutMs: cfg.firstByteTimeoutMs, idleTimeoutMs: cfg.idleTimeoutMs });
+            await proxyStream({ req, res, body, baseUrl: cfg.backends[backend], firstByteTimeoutMs, idleTimeoutMs: cfg.idleTimeoutMs });
           } finally {
             leaser.release(backend, model);
           }
