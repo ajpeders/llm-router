@@ -1,7 +1,8 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert");
-const { chooseModel, Drainer } = require("../src/drain");
+const http = require("node:http");
+const { chooseModel, Drainer, makeRunJob } = require("../src/drain");
 const { Queue } = require("../src/queue");
 const { Pool } = require("../src/pool");
 const { Leaser } = require("../src/lease");
@@ -85,6 +86,27 @@ test("pauses globally while any interactive request waits, resumes once clear", 
   d.tick();
   await d.idle();
   assert.strictEqual(queue.counts().done, 1, "tick claims A's job once the waiter queue is empty");
+});
+
+// A batch reply is non-streaming: the backend sends nothing at all until it has the
+// whole answer, so the *first byte* timeout is the real total cap for a batch job.
+// makeRunJob must use cfg.batchTimeoutMs for that, not the interactive-lane
+// firstByteTimeoutMs — otherwise a batch job dies at 120s while the reviewer's
+// intended 120s cap for the *interactive* lane doesn't get a full 30 minutes on batch.
+test("makeRunJob uses batchTimeoutMs, not firstByteTimeoutMs, as the total cap", async () => {
+  const up = http.createServer(() => {}); // never responds
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  const baseUrl = `http://127.0.0.1:${up.address().port}`;
+  try {
+    const runJob = makeRunJob({ backends: { luna: baseUrl }, firstByteTimeoutMs: 5000, idleTimeoutMs: 5000, batchTimeoutMs: 30 });
+    const start = Date.now();
+    await assert.rejects(runJob({ model: "m", request: { messages: [] } }, "luna"), /upstream_timeout/);
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 2000, `should time out at batchTimeoutMs (30ms), not sit until firstByteTimeoutMs (5000ms); took ${elapsed}ms`);
+  } finally {
+    up.closeAllConnections();
+    up.close();
+  }
 });
 
 test("failures retry, then dead fires onFinished", async () => {

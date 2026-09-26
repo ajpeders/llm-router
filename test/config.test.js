@@ -12,6 +12,7 @@ test("defaults match the spec", () => {
   assert.strictEqual(c.downAfterFails, 3);
   assert.strictEqual(c.firstByteTimeoutMs, 120000);
   assert.strictEqual(c.idleTimeoutMs, 60000);
+  assert.strictEqual(c.batchTimeoutMs, 30 * 60000);
   assert.strictEqual(c.oldestOverrideMs, 30 * 60000);
   assert.strictEqual(c.drainMaxMs, 10 * 60000);
   assert.deepStrictEqual(c.retryDelaysMs, [30000, 120000, 600000]);

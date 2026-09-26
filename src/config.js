@@ -26,6 +26,9 @@ function loadConfig(env = process.env) {
     defaultSlots: int(env, "DEFAULT_SLOTS", 2),
     firstByteTimeoutMs: int(env, "FIRST_BYTE_TIMEOUT_MS", 120000),
     idleTimeoutMs: int(env, "IDLE_TIMEOUT_MS", 60000),
+    // A batch reply is non-streaming: the backend sends nothing until the whole
+    // answer is ready, so this is the real total cap for a batch job's run.
+    batchTimeoutMs: int(env, "BATCH_TIMEOUT_MS", 30 * 60000),
     waitTimeoutMs: int(env, "WAIT_TIMEOUT_MS", 600000),
     dbPath: env.DB_PATH || "/data/jobs.db",
     oldestOverrideMs: int(env, "OLDEST_OVERRIDE_MS", 30 * 60000),

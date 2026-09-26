@@ -100,7 +100,10 @@ function makeRunJob(cfg) {
       baseUrl: cfg.backends[backend],
       path: isEmbed ? "/v1/embeddings" : "/v1/chat/completions",
       payload: { ...job.request, model: job.model, ...(isEmbed ? {} : { stream: false }) },
-      firstByteTimeoutMs: cfg.firstByteTimeoutMs,
+      // Non-streaming: headers only arrive once the whole reply is ready, so the
+      // first-byte timeout is the batch job's total cap. Use batchTimeoutMs, not the
+      // interactive lane's firstByteTimeoutMs.
+      firstByteTimeoutMs: cfg.batchTimeoutMs,
       idleTimeoutMs: cfg.idleTimeoutMs,
     });
     if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status}: ${JSON.stringify(r.json).slice(0, 300)}`);
