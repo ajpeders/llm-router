@@ -230,6 +230,13 @@ function shouldRetryStatus(statusCode) {
 
 function proxyAttempt(req, res, body, backend, isLastAttempt) {
   return new Promise((resolve) => {
+    let settled = false;
+    function settle(result) {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    }
+
     const upstream = upstreamFor(backend, req, body);
     const targetUrl = upstream.url;
     const outBody = upstream.body;
@@ -258,7 +265,7 @@ function proxyAttempt(req, res, body, backend, isLastAttempt) {
     const upstreamReq = client.request(options, (upstreamRes) => {
       if (!isLastAttempt && shouldRetryStatus(upstreamRes.statusCode)) {
         upstreamRes.resume();
-        resolve({ ok: false, reason: `status ${upstreamRes.statusCode}` });
+        settle({ ok: false, reason: `status ${upstreamRes.statusCode}` });
         return;
       }
 
@@ -266,7 +273,19 @@ function proxyAttempt(req, res, body, backend, isLastAttempt) {
       delete responseHeaders.connection;
       res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
       upstreamRes.pipe(res);
-      upstreamRes.on("end", () => resolve({ ok: true }));
+      upstreamRes.on("end", () => settle({ ok: true }));
+      // Headers are already sent by this point, so a mid-stream failure can no
+      // longer be retried on another backend. Without this handler, an upstream
+      // reset after headers (e.g. connection dropped mid-body) leaves this
+      // promise pending forever, which leaks the caller's in-flight counter and
+      // wedges /idle to false permanently. Settle so the caller's finally runs.
+      upstreamRes.on("error", () => {
+        if (!res.writableEnded) res.end();
+        settle({ ok: true });
+      });
+      // If the client disconnects mid-stream, also settle so we don't hang.
+      // This fires after normal completion too, but settle() is idempotent.
+      res.on("close", () => settle({ ok: true }));
     });
 
     upstreamReq.on("timeout", () => {
@@ -279,9 +298,9 @@ function proxyAttempt(req, res, body, backend, isLastAttempt) {
           res.writeHead(502, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: "all_backends_failed", detail: err.message }));
         }
-        resolve({ ok: true });
+        settle({ ok: true });
       } else {
-        resolve({ ok: false, reason: err.message });
+        settle({ ok: false, reason: err.message });
       }
     });
 
