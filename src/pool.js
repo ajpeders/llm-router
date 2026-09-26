@@ -36,7 +36,13 @@ class Pool {
       b.up = false;
       b.downSince = this.now();
     }
-    this.polledOnce = true;
+    // Deliberately not `this.polledOnce = true` here. polledOnce ∪ knownModels answers
+    // "does this model exist at all" — a poll *failure* teaches us nothing about the
+    // model universe, only that a backend is unreachable right now. If a restart's
+    // first poll ever fails (backend down at boot, knownModels still empty), setting
+    // polledOnce here would make every request for an existing-but-unconfirmed model
+    // look "unknown" (404) instead of "backend down" (503). Only a successful poll
+    // (applyPoll) can ever shrink the space of models we consider possibly-real.
   }
 
   capacity(b, model) { return b.slots.get(model) ?? this.defaultSlots; }

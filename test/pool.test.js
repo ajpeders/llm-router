@@ -4,6 +4,16 @@ const assert = require("node:assert");
 const { Pool } = require("../src/pool");
 const { Leaser } = require("../src/lease");
 
+test("polledOnce is set only by a successful poll, never by failures alone", () => {
+  const p = new Pool(["luna"], 2);
+  assert.strictEqual(p.polledOnce, false);
+  for (let i = 0; i < 3; i++) p.applyFailure("luna", 3);
+  assert.strictEqual(p.backends.get("luna").up, false);
+  assert.strictEqual(p.polledOnce, false, "repeated failures alone must not set polledOnce");
+  p.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 2 } });
+  assert.strictEqual(p.polledOnce, true);
+});
+
 test("acquire marks a swap in progress: loaded becomes just the newly acquired model", () => {
   const p = new Pool(["luna"], 2);
   p.applyPoll("luna", { models: ["A", "B"], loaded: ["A"], slots: { A: 2, B: 2 } });

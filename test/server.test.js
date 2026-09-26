@@ -86,6 +86,29 @@ test("known model with a down backend is 503, not 404; never-seen model is 404; 
   server.close();
 });
 
+test("backend unreachable since restart (never successfully polled): any model is 503, never 404", async () => {
+  // Simulates the moment right after a restart when the backend is down: applyFailure
+  // fires repeatedly, but applyPoll never has — so knownModels is still empty and we
+  // have no real evidence any given model doesn't exist. It must never look "unknown".
+  const cfg = { backends: { luna: "http://127.0.0.1:1" }, waitTimeoutMs: 50, firstByteTimeoutMs: 1000, idleTimeoutMs: 1000 };
+  const pool = new Pool(["luna"], 2);
+  for (let i = 0; i < 3; i++) pool.applyFailure("luna", 3);
+  assert.strictEqual(pool.backends.get("luna").up, false);
+  assert.strictEqual(pool.polledOnce, false);
+
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  const server = createServer({ cfg, pool, leaser, queue, drainer: { current: null }, now: () => 1000 });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  const r = await post(`${base}/v1/chat/completions`, { model: "anything" });
+  assert.strictEqual(r.status, 503);
+  assert.deepStrictEqual(await r.json(), { error: "backend_down", model: "anything" });
+
+  server.close();
+});
+
 test("/health and /api/models/all carry tier for the CLIs", async () => {
   const s = await setup();
   const health = await (await fetch(`${s.base}/health`)).json();
