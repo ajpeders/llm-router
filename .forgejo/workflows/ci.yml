@@ -7,11 +7,13 @@ on:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    container: node:24
     steps:
       - uses: actions/checkout@v4
-      # No package.json / deps — syntax-check the three node entrypoints.
       - name: node syntax check
         run: |
           node --check router.js
           node --check cli.js
           node --check rllm
+      - name: tests
+        run: node --test test/
