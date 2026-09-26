@@ -3,11 +3,13 @@
 const http = require("http");
 const https = require("https");
 const { URL } = require("url");
+const { createIdleTracker } = require("./idle");
 
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const MODEL_REFRESH_MS = parseInt(process.env.MODEL_REFRESH_MS || "30000", 10);
 const TAGS_TIMEOUT_MS = parseInt(process.env.TAGS_TIMEOUT_MS || "4000", 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "300000", 10);
+const IDLE_WINDOW_MS = parseInt(process.env.IDLE_WINDOW_MS || "120000", 10);
 const BACKEND_TIER = (process.env.BACKEND_TIER || "mac,arch")
   .split(",")
   .map((s) => s.trim())
@@ -75,6 +77,8 @@ for (const backend of BACKEND_NAMES) modelSets[backend] = new Set();
 function log(message) {
   console.log(`[llm-router] ${message}`);
 }
+
+const idleTracker = createIdleTracker(IDLE_WINDOW_MS);
 
 async function fetchJson(url, timeoutMs) {
   const controller = new AbortController();
@@ -226,6 +230,13 @@ function shouldRetryStatus(statusCode) {
 
 function proxyAttempt(req, res, body, backend, isLastAttempt) {
   return new Promise((resolve) => {
+    let settled = false;
+    function settle(result) {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    }
+
     const upstream = upstreamFor(backend, req, body);
     const targetUrl = upstream.url;
     const outBody = upstream.body;
@@ -254,7 +265,7 @@ function proxyAttempt(req, res, body, backend, isLastAttempt) {
     const upstreamReq = client.request(options, (upstreamRes) => {
       if (!isLastAttempt && shouldRetryStatus(upstreamRes.statusCode)) {
         upstreamRes.resume();
-        resolve({ ok: false, reason: `status ${upstreamRes.statusCode}` });
+        settle({ ok: false, reason: `status ${upstreamRes.statusCode}` });
         return;
       }
 
@@ -262,7 +273,19 @@ function proxyAttempt(req, res, body, backend, isLastAttempt) {
       delete responseHeaders.connection;
       res.writeHead(upstreamRes.statusCode || 502, responseHeaders);
       upstreamRes.pipe(res);
-      upstreamRes.on("end", () => resolve({ ok: true }));
+      upstreamRes.on("end", () => settle({ ok: true }));
+      // Headers are already sent by this point, so a mid-stream failure can no
+      // longer be retried on another backend. Without this handler, an upstream
+      // reset after headers (e.g. connection dropped mid-body) leaves this
+      // promise pending forever, which leaks the caller's in-flight counter and
+      // wedges /idle to false permanently. Settle so the caller's finally runs.
+      upstreamRes.on("error", () => {
+        if (!res.writableEnded) res.end();
+        settle({ ok: true });
+      });
+      // If the client disconnects mid-stream, also settle so we don't hang.
+      // This fires after normal completion too, but settle() is idempotent.
+      res.on("close", () => settle({ ok: true }));
     });
 
     upstreamReq.on("timeout", () => {
@@ -275,9 +298,9 @@ function proxyAttempt(req, res, body, backend, isLastAttempt) {
           res.writeHead(502, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: "all_backends_failed", detail: err.message }));
         }
-        resolve({ ok: true });
+        settle({ ok: true });
       } else {
-        resolve({ ok: false, reason: err.message });
+        settle({ ok: false, reason: err.message });
       }
     });
 
@@ -308,6 +331,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.url === "/idle") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(idleTracker.snapshot(Date.now())));
+    return;
+  }
+
+  const isBatch = req.headers["x-llm-router-batch"] === "1";
+  if (!isBatch) {
+    idleTracker.begin();
+    idleTracker.markActivity(Date.now());
+  }
   try {
     const body = await collectBody(req);
     const model = getRequestedModel(req, body);
@@ -330,11 +364,13 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "router_error", detail: err.message }));
     }
+  } finally {
+    if (!isBatch) idleTracker.end();
   }
 });
 
 server.listen(PORT, "0.0.0.0", async () => {
-  log(`starting on :${PORT}`);
+  log(`starting on :${server.address().port}`);
   log(`tier order: ${JSON.stringify(TIER_ORDER)}`);
   log(`backends: ${JSON.stringify(BACKENDS)}`);
   log(MINIMAX_API_KEY ? `minimax: ${MINIMAX_MODEL} (${MINIMAX_PRIORITY}) via ${MINIMAX_API_BASE}` : "minimax: disabled");
