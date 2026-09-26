@@ -20,8 +20,11 @@ class Drainer {
   tick() {
     if (this.leaser.interactiveWaiting) return;
     const now = this.now();
-    const servable = new Set(this.pool.allModels());
-    const pending = this.queue.pendingByModel(now).filter((p) => servable.has(p.model));
+    // Only models the batch lane can ever get a slot for (structurally, ignoring
+    // current inflight) — a 1-slot model would otherwise park the drainer on it
+    // forever, since tryAcquire can never succeed for it. Jobs for such a model
+    // simply stay pending.
+    const pending = this.queue.pendingByModel(now).filter((p) => this.pool.batchServable(p.model));
 
     const hasCurrent = this.current && pending.some((p) => p.model === this.current);
     if (!hasCurrent || now - this.drainStart >= this.cfg.drainMaxMs) {
@@ -29,7 +32,11 @@ class Drainer {
       // switch would force a swap under them.
       if (this.running.size > 0) return;
       const next = chooseModel(pending, now, this.cfg.oldestOverrideMs);
-      if (next !== this.current) this.drainStart = now;
+      // Reset the window on every re-pick, even when the same model is chosen again —
+      // otherwise, once the window has expired once, drainStart stays stuck in the
+      // past and every later tick re-hits the "nothing in flight" gate above forever,
+      // throttling steady-state draining of the same model to fully-idle-only.
+      this.drainStart = now;
       this.current = next;
     }
     if (!this.current) return;
@@ -42,7 +49,13 @@ class Drainer {
         return; // no backend serves it right now
       }
       if (!backend) return;
-      const job = this.queue.claim(this.current, now);
+      let job;
+      try {
+        job = this.queue.claim(this.current, now);
+      } catch (err) {
+        this.leaser.release(backend, this.current);
+        throw err;
+      }
       if (!job) { this.leaser.release(backend, this.current); return; }
       this._run(job, backend);
     }
@@ -61,10 +74,18 @@ class Drainer {
       } finally {
         this.leaser.release(backend, job.model);
       }
-      if (final) await this.onFinished(final);
+      if (final) {
+        try {
+          await this.onFinished(final);
+        } catch (err) {
+          console.log(`[llm-router] onFinished for ${job.id} failed: ${err.message}`);
+        }
+      }
     })();
     this.running.add(p);
-    p.finally(() => { this.running.delete(p); this.tick(); });
+    p.finally(() => { this.running.delete(p); this.tick(); }).catch((err) => {
+      console.log(`[llm-router] onFinished for ${job.id} failed: ${err.message}`);
+    });
   }
 
   async idle() {

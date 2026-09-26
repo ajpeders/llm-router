@@ -37,19 +37,50 @@ test("interleaved jobs for two models load each model once", async () => {
   assert.strictEqual(queue.counts().done, 6);
 });
 
-test("pauses while an interactive request waits", async () => {
+test("single-slot model is never batch-servable; other models still drain", async () => {
   const pool = new Pool(["luna"], 2);
-  pool.applyPoll("luna", { models: ["A"], loaded: ["A"], slots: { A: 1 } });
+  pool.applyPoll("luna", { models: ["A", "B"], loaded: ["A", "B"], slots: { A: 1, B: 3 } });
   const leaser = new Leaser(pool);
-  leaser.tryAcquire("A", "interactive");
-  const waiting = leaser.acquire("A", "interactive", 1000);
   const queue = new Queue(":memory:");
   queue.submit({ model: "A", request: {} }, 0);
+  queue.submit({ model: "A", request: {} }, 0);
+  queue.submit({ model: "A", request: {} }, 0);
+  queue.submit({ model: "B", request: {} }, 0);
+  const d = new Drainer({ queue, leaser, pool, cfg, runJob: async () => ({}), onFinished: async () => {}, now: () => 1 });
+  for (let i = 0; i < 5; i++) { d.tick(); await d.idle(); }
+  assert.strictEqual(queue.counts().done, 1, "B's job must complete");
+  assert.strictEqual(queue.counts().pending, 3, "A's jobs stay pending forever — 1 slot leaves no batch capacity");
+});
+
+// interactiveWaiting is a GLOBAL pause, not a per-model capacity check: an interactive
+// waiter for model B must block draining of model A even though A has plenty of its
+// own free capacity. (A saturated single-model scenario can't distinguish this, because
+// the shared per-model inflight counter already denies batch capacity whenever that
+// same model's interactive lane is saturated enough to queue a waiter.)
+test("pauses globally while any interactive request waits, resumes once clear", async () => {
+  const pool = new Pool(["luna"], 2);
+  pool.applyPoll("luna", { models: ["A", "B"], loaded: ["A", "B"], slots: { A: 3, B: 1 } });
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  queue.submit({ model: "A", request: {} }, 0);
+
+  const h1 = leaser.tryAcquire("B", "interactive");
+  assert.ok(h1);
+  const waiting = leaser.acquire("B", "interactive", 1000); // B's only slot is held; this queues
+
   const d = new Drainer({ queue, leaser, pool, cfg, runJob: async () => ({}), onFinished: async () => {}, now: () => 1 });
   d.tick();
-  assert.strictEqual(queue.counts().pending, 1);
-  leaser.release("luna", "A");
-  await waiting;
+  assert.strictEqual(queue.counts().pending, 1, "tick must not claim A's job while B has an interactive waiter");
+  assert.strictEqual(leaser.interactiveWaiting, true);
+
+  leaser.release("luna", "B"); // frees B's slot; the waiting interactive request is served
+  const gotBackend = await waiting;
+  assert.strictEqual(gotBackend, "luna");
+  assert.strictEqual(leaser.interactiveWaiting, false);
+
+  d.tick();
+  await d.idle();
+  assert.strictEqual(queue.counts().done, 1, "tick claims A's job once the waiter queue is empty");
 });
 
 test("failures retry, then dead fires onFinished", async () => {
@@ -67,4 +98,32 @@ test("failures retry, then dead fires onFinished", async () => {
   for (let i = 0; i < 6; i++) { d.tick(); await d.idle(); }
   assert.strictEqual(queue.get(id).status, "dead");
   assert.deepStrictEqual(finished, ["dead"]);
+});
+
+test("onFinished throwing does not crash the process; job stays done, slot released", async () => {
+  const pool = new Pool(["luna"], 2);
+  pool.applyPoll("luna", { models: ["A"], loaded: ["A"], slots: { A: 2 } });
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  const id = queue.submit({ model: "A", request: {} }, 0).id;
+
+  let unhandled = null;
+  const onUnhandledRejection = (err) => { unhandled = err; };
+  process.on("unhandledRejection", onUnhandledRejection);
+  try {
+    const d = new Drainer({
+      queue, leaser, pool, cfg,
+      runJob: async () => ({ ok: true }),
+      onFinished: async () => { throw new Error("ntfy blip"); },
+      now: () => 1,
+    });
+    d.tick();
+    await d.idle();
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
+
+  assert.strictEqual(unhandled, null, "a throwing onFinished must not produce an unhandled rejection");
+  assert.strictEqual(queue.get(id).status, "done");
+  assert.strictEqual(pool.totalInflight(pool.backends.get("luna")), 0);
 });

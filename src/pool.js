@@ -53,6 +53,16 @@ class Pool {
     return [...all].sort();
   }
 
+  // Whether the batch lane (which always reserves 1 slot) can ever get a slot for this
+  // model on some up backend. Structural only — ignores current inflight, so a model
+  // that's merely busy right now still counts, but one with only 1 total slot never does.
+  batchServable(model) {
+    for (const b of this.backends.values()) {
+      if (b.up && b.models.has(model) && this.capacity(b, model) - 1 > 0) return true;
+    }
+    return false;
+  }
+
   snapshot() {
     return [...this.backends.values()].map((b) => ({
       name: b.name,
