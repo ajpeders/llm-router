@@ -3,18 +3,19 @@ services:
     container_name: llm-router
     build:
       context: .
+    init: true
     restart: unless-stopped
     environment:
       - PORT=8080
-      - BACKEND_TIER=${LLM_ROUTER_BACKEND_TIER}
       - BACKENDS_JSON=${LLM_ROUTER_BACKENDS_JSON}
-      - MODEL_REFRESH_MS=${LLM_ROUTER_MODEL_REFRESH_MS:-30000}
-      - TAGS_TIMEOUT_MS=${LLM_ROUTER_TAGS_TIMEOUT_MS:-4000}
-      - REQUEST_TIMEOUT_MS=${LLM_ROUTER_REQUEST_TIMEOUT_MS:-300000}
-      - MINIMAX_API_KEY=${LLM_ROUTER_MINIMAX_API_KEY:-}
-      - MINIMAX_MODEL=${LLM_ROUTER_MINIMAX_MODEL:-MiniMax-Text-01}
-      - MINIMAX_API_BASE=${LLM_ROUTER_MINIMAX_API_BASE:-https://api.minimax.chat/v1}
-      - MINIMAX_PRIORITY=${LLM_ROUTER_MINIMAX_PRIORITY:-fallback}
+      - DEFAULT_SLOTS=${LLM_ROUTER_DEFAULT_SLOTS:-2}
+      - DB_PATH=/data/jobs.db
+      - BATCH_TIMEOUT_MS=${LLM_ROUTER_BATCH_TIMEOUT_MS:-1800000}
+      - IDLE_WINDOW_MS=${LLM_ROUTER_IDLE_WINDOW_MS:-120000}
+      - NTFY_URL=${LLM_ROUTER_NTFY_URL:-}
+      - NTFY_TOKEN=${LLM_ROUTER_NTFY_TOKEN:-}
+    volumes:
+      - ../../state/llm-router:/data
     labels:
       - traefik.enable=true
       - traefik.docker.network=web

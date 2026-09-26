@@ -1,16 +1,15 @@
 # HOWTO
 
 Step-by-step guides for common tasks. See README.md for the full env var
-reference and API examples.
+reference and API examples, ARCHITECTURE.md for how the pool and queue work.
 
 ## Run the router locally
 
 ```bash
-node router.js
+BACKENDS_JSON='{"luna":"http://100.84.247.20:11434"}' node router.js
 ```
 
-Uses the built-in default backends (`mac`, `arch`) unless you override them
-(see below). Check it came up:
+`BACKENDS_JSON` is required — there's no built-in default. Check it came up:
 
 ```bash
 curl http://localhost:8080/health
@@ -18,44 +17,17 @@ curl http://localhost:8080/health
 
 ## Add or remove a backend machine
 
-Set `BACKENDS_JSON` to the full map of backend name → Ollama base URL, and
-restart the router (it re-reads env at startup only):
+Set `BACKENDS_JSON` to the full map of backend name → base URL, and restart
+the router (it re-reads env at startup only):
 
 ```bash
-BACKENDS_JSON='{"mac":"http://192.168.0.47:11434","arch":"http://192.168.0.40:11434","gpu":"http://192.168.0.55:11434"}' \
+BACKENDS_JSON='{"luna":"http://100.84.247.20:11434","mac":"http://192.168.0.47:11434"}' \
 node router.js
 ```
 
-Any backend present in `BACKENDS_JSON` is used, whether or not it's listed
-in `BACKEND_TIER`.
-
-## Change backend priority order
-
-Set `BACKEND_TIER` to a comma-separated list of backend names, most
-preferred first:
-
-```bash
-BACKEND_TIER=gpu,mac,arch node router.js
-```
-
-Backends not listed are still usable — they're appended after the named
-ones. Priority only matters when a request doesn't specify a model, or when
-none of the tiered backends currently report having the requested model.
-
-## Enable MiniMax cloud fallback
-
-Set the key in `.env` (the other `LLM_ROUTER_MINIMAX_*` vars are optional,
-see `.env.example`) and redeploy:
-
-```bash
-LLM_ROUTER_MINIMAX_API_KEY=your_minimax_key
-LLM_ROUTER_MINIMAX_MODEL=MiniMax-Text-01
-```
-
-Only OpenAI-style `POST /v1/chat/completions` requests are eligible. Confirm
-it's on with `curl http://localhost:8080/health` — the `minimax` field shows
-the model and priority (`null` when disabled). Responses served by MiniMax
-log as `-> minimax`.
+Every backend in `BACKENDS_JSON` is polled and used — there's no separate
+priority list; `pick.js` chooses among up backends that report the model and
+have a free slot.
 
 ## Deploy with Docker Compose
 
@@ -65,15 +37,19 @@ log as `-> minimax`.
    ```
 2. Start it:
    ```bash
-   docker compose up -d llm-router
+   docker compose up -d --no-deps --build llm-router
    ```
+   `--dry-run` first is worth doing on a shared compose file — confirm it
+   only touches `llm-router`.
 3. Confirm it's serving:
    ```bash
    curl https://<LLM_ROUTER_DOMAIN>/health
    ```
 
-Only `router.js` runs in the container — `rllm` and `cli.js` are for use on
-a client machine, not something you deploy.
+Only `router.js` + `src/` run in the container — `rllm` and `cli.js` are for
+use on a client machine, not something you deploy. Job queue state
+(`jobs.db`) persists in the bind-mounted `state/llm-router/` — it survives a
+container recreate.
 
 ## Install and use `rllm`
 
@@ -104,37 +80,70 @@ Inside a `chat`/`code` session: `/file <path>` to load more context,
 `/clear` to reset history, `/model <name>` to switch models, `/quit` to
 exit.
 
-## Check router health and model availability
+## Check the router
 
 ```bash
-curl http://localhost:8080/health          # per-backend model counts + tier order
-curl http://localhost:8080/api/models/all  # merged model list + per-backend breakdown
+curl http://localhost:8080/v1/models   # merged model list across all backends
+curl http://localhost:8080/health      # tier + per-backend model counts
+curl http://localhost:8080/status      # full pool + queue snapshot
 ```
 
-`rllm models` and `cli.js models` both wrap the second call with formatted
-output.
+Chat completion, end to end:
+
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"say ok"}]}'
+```
+
+## Submit a batch job
+
+```bash
+ID=$(curl -s -X POST http://localhost:8080/jobs \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen3:8b","request":{"messages":[{"role":"user","content":"say ok"}]}}' \
+  | sed -E 's/.*"id":"([^"]+)".*/\1/')
+
+# poll until done
+until curl -s http://localhost:8080/jobs/$ID | grep -q '"status":"done"'; do sleep 2; done
+curl http://localhost:8080/jobs/$ID
+```
+
+Add `"priority": 1` to jump ahead of same-model jobs at the default priority,
+`"dedupe_key": "..."` to collapse duplicate resubmits while one is still
+`pending`/`running`, or `"callback": "http://..."` to have the finished job
+POSTed back instead of polling.
 
 ## Diagnose a backend that isn't receiving traffic
 
-1. `curl http://localhost:8080/health` — if a backend shows `0` models, its
-   last `/api/tags` poll failed or returned nothing.
-2. Check the router's stdout logs for `model refresh failed for <backend>
-   (<url>): <error>` — this fires every `MODEL_REFRESH_MS` (default 30s)
-   until the backend is reachable again.
-3. Confirm the backend's Ollama is reachable directly:
+1. `curl http://localhost:8080/status` — if a backend shows `"up": false`,
+   its last `DOWN_AFTER_FAILS` (default 3) polls all failed; `down_since`
+   shows when.
+2. Check the router's stdout logs for `poll <backend> failed: <error>` —
+   this fires every `POLL_MS` (default 10s) until the backend answers again.
+3. Confirm the backend is reachable directly:
    ```bash
-   curl http://<backend-ip>:11434/api/tags
+   curl http://<backend-ip>:11434/v1/models
    ```
 4. Once fixed, no restart is needed — the router picks it back up on its
    next poll cycle.
 
-## Run the CI check locally
+## Check whether the router is idle (for automation gates)
 
-There's no build step or dependency install; CI just syntax-checks the
-three entrypoints:
+```bash
+curl http://localhost:8080/idle
+```
+
+`idle: true` means no interactive request is in flight and none has arrived
+within `IDLE_WINDOW_MS`. A batch consumer that itself calls `/v1/*` directly
+(rather than through `/jobs`) should send `x-llm-router-batch: 1` so its own
+traffic doesn't keep `/idle` permanently false.
+
+## Run the CI checks locally
 
 ```bash
 node --check router.js
 node --check cli.js
 node --check rllm
+node --test 'test/*.test.js'
 ```

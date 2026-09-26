@@ -2,117 +2,155 @@
 
 ## Overview
 
-llm-router is a small Node.js HTTP proxy (`router.js`, no dependencies — uses
-only Node core modules and global `fetch`) that sits in front of one or more
-Ollama instances and load-balances/fails over between them. Clients talk to
-it exactly as they would talk to Ollama; it forwards the request to a backend
-machine, retries on failure, and merges each backend's model list into one
-view.
+llm-router is a Node.js pool router (`router.js` + `src/`, uses `node:sqlite`
+and `node:http`/global `fetch`, no npm dependencies) in front of one or more
+OpenAI-API-compatible backends (llama-swap, Ollama). It serves two lanes on
+top of the same backend pool:
+
+- **Interactive** (`/v1/*`): proxied straight through, streamed, for
+  chat/code-assistant clients that need a live answer.
+- **Batch** (`/jobs`): a persistent, model-grouped job queue, worked off by a
+  drainer that loads one model at a time so a big model isn't reloaded per
+  job. Meant for callers that don't need an answer *now* — digest jobs,
+  overnight summarization, anything queued by a triage/automation client.
+
+Interactive requests always win a contested slot over batch (see Leaser
+below), so batch work never blocks live chat.
 
 Two CLIs ship alongside it:
 - `rllm` — the documented, day-to-day CLI (one-shot prompts, chat, code
-  assistant with file context).
-- `cli.js` — an earlier CLI (`status` / `models` / `run` / `chat` subcommands)
-  kept in the repo but not referenced in README or the Dockerfile; not part
-  of the documented workflow.
+  assistant with file context), talks to `/v1/*`.
+- `cli.js` — an earlier CLI (`status`/`models`/`run`/`chat`), also ported to
+  `/v1/*`, kept in the repo and syntax-checked by CI but not the documented
+  workflow.
 
 ## Components
 
 | File | Role |
 |------|------|
-| `router.js` | The proxy/router server. Only file shipped in the Docker image. |
+| `router.js` | Entry point: builds config, pool, leaser, queue, drainer, server; starts discovery polling and the HTTP listener. |
+| `src/config.js` | Reads and validates env into a frozen config object. |
+| `src/pool.js` | In-memory backend state: up/down, model sets, loaded model (llama-swap), per-model slot counts, per-model inflight counts. |
+| `src/discovery.js` | Polls every backend's `/v1/models` (+ `/running`, `/upstream/<model>/slots` on llama-swap) on an interval; feeds `pool`. |
+| `src/lease.js` | `Leaser`: acquires/releases a `(backend, model)` slot; queues waiters when none is free; interactive waiters always resolve before batch waiters. |
+| `src/pick.js` | Picks which up backend to try for a model/lane, given current slot capacity and inflight. |
+| `src/queue.js` | SQLite-backed job table (`node:sqlite`): submit, claim, complete, fail-with-retry, purge, counts. |
+| `src/drain.js` | `Drainer`: picks one model at a time to work off the batch queue, claims jobs, runs them through the pool/leaser, handles retry/dead transitions. |
+| `src/upstream.js` | Raw HTTP(S) plumbing: streamed proxy for interactive, buffered JSON call for batch job runs. |
+| `src/idle.js` | Tracks in-flight interactive requests + last-activity timestamp for `/idle`. |
+| `src/notify.js` | Posts a dead-job alert to ntfy when configured. |
+| `src/server.js` | Route table: `/health`, `/idle`, `/v1/models`, `/v1/*` proxy, `/jobs`, `/jobs/:id`, `/status`. |
 | `rllm` | CLI client for the router (prompt, chat, code assistant). |
-| `cli.js` | Alternate CLI client (`status`, `models`, `run`, `chat`). Not built into the Docker image, not documented in README. |
-| `Dockerfile` | `node:20-alpine`, copies `router.js` only, runs `node router.js`. |
-| `docker-compose.yml` | Runs the router behind Traefik (`web` network, TLS via `letsencrypt`, `local-only@file` middleware). |
-| `.forgejo/workflows/ci.yml` | CI: no `package.json`/deps, so it just runs `node --check` on `router.js`, `cli.js`, and `rllm`. |
+| `cli.js` | Alternate CLI client (`status`, `models`, `run`, `chat`). |
+| `Dockerfile` | `node:24-alpine`, copies `router.js` + `src/`, runs `node router.js`. |
+| `docker-compose.yml` | Runs the router behind Traefik (`web` network, TLS via `letsencrypt`, `local-only@file` middleware), `init: true` so SIGTERM reaches the node process directly, and a bind mount for `jobs.db`. |
+| `.forgejo/workflows/ci.yml` | `node --check` on `router.js`/`cli.js`/`rllm`, then `node --test 'test/*.test.js'`. |
 
 ## Data flow
 
-1. A client (Ollama-compatible SDK, `curl`, `rllm`, `cli.js`, ...) sends a
-   request to the router (e.g. `POST /api/generate`, `POST /api/chat`).
-2. The router reads the full request body and determines the requested
-   model, in priority order: JSON body `model` field → `x-model` header →
-   `?model=` query param.
-3. It builds an ordered list of backends to try (`orderedBackendsForModel`):
-   backends currently known to have that model come first (in `BACKEND_TIER`
-   order), followed by the rest of the tier order as fallback. If no model
-   is given, or no backend currently reports it, the plain tier order is
-   used.
-4. It proxies the raw request to the first backend (`proxyAttempt`), copying
-   headers/body and streaming the upstream response straight through,
-   tagging it with `x-llm-router-backend: <name>`.
-5. On a 5xx response or connection error, and if it wasn't the last backend
-   in the list, it retries the next backend. The final attempt returns
-   whatever that backend gives (success, error status, or a synthesized
-   `502 all_backends_failed`) regardless of status code.
-6. `GET /health`, `GET /api/models/all` (alias `/models/all`), and `GET /idle`
-   are handled directly by the router and never proxied.
+### Interactive (`/v1/*`)
 
-## Idle tracking
+1. A client sends `POST /v1/chat/completions` (or any other `/v1/*` path)
+   with a JSON body carrying `model`.
+2. The server reads the model, marks idle-tracker activity (unless
+   `x-llm-router-batch: 1`), and asks the leaser to `acquire(model,
+   "interactive", waitTimeoutMs)`.
+3. The leaser asks `pick.js` for a backend that is up, reports (or has never
+   disproven) the model, and has a free slot; if none is free right now, the
+   request waits up to `WAIT_TIMEOUT_MS` for one to open up.
+4. `no_backend` is distinguished into `404 unknown_model` (no backend has
+   *ever* reported this model, and at least one poll has succeeded) vs. `503
+   backend_down` (every backend that could serve it is down, or we haven't
+   polled successfully yet — ambiguous, so it errs toward not lying).
+5. On acquire, the request is streamed straight through to the backend
+   (`proxyStream`), tagged `x-llm-router-backend: <name>` on the response,
+   and the slot is released in a `finally` regardless of outcome.
 
-The router tracks how many proxied requests are currently in flight and the
-timestamp of the last "real" request, via `createIdleTracker` (`idle.js`).
-`GET /idle` reports `{ idle, inFlight, idleSeconds, quietWindowMs }`, where
-`idle` is true once `inFlight` is zero and the quiet period exceeds
-`IDLE_WINDOW_MS`. Requests carrying the header `x-llm-router-batch: 1` are
-excluded from this tracking (no `begin`/`markActivity` calls), so that an
-idle-triggered batch-job consumer's own traffic through the router doesn't
-mask true idleness.
+### Batch (`/jobs`)
+
+1. `POST /jobs` validates `{model, request, priority?, callback?,
+   dedupe_key?}`, and inserts a `pending` row (or returns the existing job's
+   id if `dedupe_key` matches one still `pending`/`running`).
+2. The drainer's `tick()` (called after every discovery poll and every job
+   completion) picks one model to work off — the one with the most pending
+   jobs, unless something has been waiting past `OLDEST_OVERRIDE_MS`, in
+   which case that starved model wins outright — and claims/runs jobs for it
+   until no more capacity or no more pending jobs for that model.
+3. The drainer never switches models while jobs for the current model are
+   still in flight, and won't switch away from an empty model list without a
+   window expiring, avoiding an oscillation that would keep reloading the
+   backend's resident model.
+4. A finished job's result is written back (`done` + `result`), or on
+   failure it's retried at `retryDelaysMs` (30s, 2m, 10m) with backoff, going
+   `dead` after all three retries are exhausted. A `dead` job with `NTFY_URL`
+   configured triggers an ntfy alert.
+5. `GET /jobs/:id` returns the full row (status, result/error, attempts,
+   timestamps).
+
+### Both lanes
+
+- `GET /status` returns the pool snapshot (per-backend up/down, models,
+  loaded model, slots, inflight) plus queue counts, per-model pending
+  breakdown, oldest-pending age, and which model (if any) is currently
+  draining.
+- `GET /health` and `GET /v1/models` are lighter summaries for quick checks.
 
 ## Model discovery
 
-- `refreshModels()` polls every backend's `/api/tags` in parallel on an
-  interval (`MODEL_REFRESH_MS`, default 30s) with a per-call timeout
-  (`TAGS_TIMEOUT_MS`).
-- Each backend's response models are stored as a `Set` of identifiers,
-  including both the `model` and `name` fields Ollama returns (covers naming
-  differences across Ollama versions).
-- A failed poll clears that backend's model set (rather than keeping stale
-  data) and logs the error.
-- `buildMergedModelsPayload()` merges all backends' sets into a sorted,
-  deduplicated list plus a `by_backend` breakdown — this is what
-  `/api/models/all` returns and what `rllm`/`cli.js` read to list/pick
-  models.
+- `startDiscovery()` polls every backend's `/v1/models` in parallel every
+  `POLL_MS`, skipping a tick if the previous one is still in flight.
+- On llama-swap, it also polls `/running` for the currently-loaded model and
+  caches `/upstream/<model>/slots` per model **forever** once fetched —
+  re-fetching it on every poll would itself trigger a model load on
+  llama-swap, which is the exact bug the cache avoids. Ollama backends have
+  no `/running`; `loaded` stays `null` for them (capacity always known)
+  rather than `[]` (would read as "loaded nothing").
+- A successful poll is the only thing that can shrink "models we don't yet
+  know exist" — a poll *failure* only means the backend is unreachable right
+  now, so it must never be conflated with "this model doesn't exist"
+  (`pool.polledOnce`/`knownModels` exist specifically to keep those two
+  cases apart across a restart before the first poll lands).
+- 3 consecutive failed polls (`DOWN_AFTER_FAILS`) mark a backend down;
+  `down_since` records when.
 
 ## Key decisions
 
-- **Zero dependencies.** The router only uses Node's `http`/`https`/`url`
-  and the global `fetch`; the CI check reflects this (`node --check`, no
-  `npm install`).
-- **Transparent proxy, not a client wrapper.** Any Ollama-compatible client
-  works against the router unmodified — it forwards method, path, headers,
-  and body as-is.
-- **Retry only on 5xx / transport errors**, never on 4xx — a bad request
-  from the client is assumed to be the client's fault, so it isn't
-  redistributed across backends.
-- **Model-aware routing with graceful fallback.** The router prefers a
-  backend that already reports having the requested model (avoids a cold
-  pull), but if none do, it still tries the full tier order rather than
-  failing outright.
-- **Backend list is config, not code.** `BACKENDS_JSON` defines available
-  backends; `BACKEND_TIER` only affects ordering/priority — backends left
-  out of `BACKEND_TIER` are still used, appended at the end.
-- **`rllm`'s "best model" heuristic is purely lexical**: it regexes the
-  trailing `<number>b` in a model name (e.g. `qwen3:32b`) and picks the
-  highest value when no model is pinned via `-m`/`RLLM_MODEL`. It has no
-  awareness of actual capability or backend load.
-- **MiniMax is an optional cloud backend, chat-completions only.** Enabled by
-  `MINIMAX_API_KEY`. Only `POST /v1/chat/completions` can go there — MiniMax
-  speaks the OpenAI API, so Ollama-native `/api/*` routes stay local rather
-  than being translated. The request's `model` is rewritten to
-  `MINIMAX_MODEL` and the auth header replaced with the MiniMax key. With
-  `MINIMAX_PRIORITY=fallback` it's tried last, *except* it goes first when no
-  local backend lists the requested model (a local 404 isn't retried, so
-  otherwise it would never be reached) or when `MINIMAX_MODEL` is requested
-  by name. `primary` always tries it first.
+- **Zero npm dependencies.** Only Node core modules (`node:sqlite`,
+  `node:http`/`https`, global `fetch`) — CI reflects this (`node --check`,
+  no install step) plus `node --test` for the actual unit tests.
+- **Interactive always outranks batch for a contested slot.** `Leaser.notify`
+  resolves interactive waiters before batch waiters regardless of queue
+  order, so a live chat request never waits behind a queued batch job.
+- **The batch lane always reserves capacity, never claims the last slot.**
+  `Pool.batchServable` requires `capacity - 1 > 0` — a 1-slot model is
+  structurally unservable by batch, so those jobs simply stay pending rather
+  than starving interactive traffic.
+- **Batch drains one model at a time.** Loading a model onto a backend
+  (especially via llama-swap) is expensive; grouping by model amortizes that
+  cost across every pending job for it instead of paying it per job.
+- **OpenAI API only, no more `/api/*` Ollama-native proxying.** Both
+  interactive and batch traffic speak `/v1/chat/completions` /
+  `/v1/embeddings` — this is what lets the router treat llama-swap and
+  Ollama backends identically.
+- **Retry only on backend/transport failure**, not on a 4xx from the model
+  request itself — a bad request is the caller's fault and isn't retried
+  across backends or requeued.
+- **The queue is durable (SQLite, WAL mode), not in-memory.** A router
+  restart recovers `running` jobs back to `pending` (`recoverRunning`) rather
+  than losing in-flight work.
 
 ## Deployment
 
-- The Docker image contains only `router.js`; `rllm` and `cli.js` are meant
-  to be run/installed on a client machine, not inside the container.
+- The Docker image contains `router.js` + `src/`; `rllm` and `cli.js` are
+  meant to be run/installed on a client machine, not inside the container.
 - `docker-compose.yml` exposes the service through Traefik with TLS and a
-  `local-only@file` middleware (LAN-only access), matching the router's role
-  as an internal homelab service.
+  `local-only@file` middleware (LAN-only access) — matching the router's
+  role as an internal homelab service — and mounts `../../state/llm-router`
+  to `/data` for `jobs.db`.
 - All runtime configuration is environment-variable driven (see README) —
   there is no config file.
+- No consumer is pointed at it yet. The Traefik repoint of
+  `llm.thelunadog.com` to this router is blocked on lunabot, which still
+  calls Ollama-native `/api/*` endpoints (`apps/discordbot/services/llm.py`)
+  that this router no longer proxies. Every current LLM consumer still talks
+  to luna directly (see ROADMAP).

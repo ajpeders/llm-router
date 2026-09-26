@@ -1,8 +1,12 @@
 # llm-router
 
-Lightweight proxy that load-balances requests across multiple [Ollama](https://ollama.com) backends. Routes to the backend that has the requested model, retries on failure, and exposes a merged model list across all machines.
+Node.js pool router in front of one or more OpenAI-API-compatible LLM
+backends (llama-swap, Ollama). It load-balances and fails over between
+backends per model, and adds a persistent batch job queue (`/jobs`) for
+non-interactive work that shouldn't compete with live chat traffic.
 
-Includes `rllm` — a minimal CLI for one-shot prompts, chat, and code assistance.
+Includes `rllm` — a minimal CLI for one-shot prompts, chat, and code
+assistance.
 
 ---
 
@@ -19,24 +23,22 @@ node router.js
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | Listen port |
-| `BACKENDS_JSON` | `{"mac":"http://192.168.0.47:11434","arch":"http://192.168.0.40:11434"}` | Backend name → Ollama URL |
-| `BACKEND_TIER` | `mac,arch` | Priority order (comma-separated) |
-| `MODEL_REFRESH_MS` | `30000` | How often to poll backends for models |
-| `TAGS_TIMEOUT_MS` | `4000` | Timeout for model list fetch |
-| `REQUEST_TIMEOUT_MS` | `300000` | Proxy request timeout |
-| `MINIMAX_API_KEY` | *(unset)* | Enables MiniMax cloud backend for `/v1/chat/completions` |
-| `MINIMAX_MODEL` | `MiniMax-Text-01` | Model sent to MiniMax (overrides the request's model) |
-| `MINIMAX_API_BASE` | `https://api.minimax.chat/v1` | MiniMax OpenAI-compatible base URL |
-| `MINIMAX_PRIORITY` | `fallback` | `fallback` (after local) or `primary` (before local) |
-| `IDLE_WINDOW_MS` | `120000` | Quiet window (ms) with no real requests before `/idle` reports idle |
-
-**Adding machines:**
-
-```bash
-BACKENDS_JSON='{"mac":"http://192.168.0.47:11434","arch":"http://192.168.0.40:11434","gpu":"http://192.168.0.55:11434"}' \
-BACKEND_TIER=gpu,mac,arch \
-node router.js
-```
+| `BACKENDS_JSON` | *(required)* | Backend name → base URL, e.g. `{"luna":"http://100.84.247.20:11434","mac":"http://192.168.0.47:11434"}`. Same model IDs must exist on every backend that serves them. |
+| `DEFAULT_SLOTS` | `2` | Slot count assumed for a model until its backend reports `/upstream/<model>/slots` (llama-swap only) |
+| `POLL_MS` | `10000` | Backend poll interval |
+| `POLL_TIMEOUT_MS` | `4000` | Per-poll timeout |
+| `DOWN_AFTER_FAILS` | `3` | Consecutive failed polls before a backend is marked down |
+| `FIRST_BYTE_TIMEOUT_MS` | `120000` | Interactive-lane timeout waiting for the first response byte |
+| `IDLE_TIMEOUT_MS` | `60000` | Stream idle timeout (interactive and batch) |
+| `IDLE_WINDOW_MS` | `120000` | Quiet window with no real requests before `/idle` reports idle |
+| `BATCH_TIMEOUT_MS` | `1800000` | Total cap for a batch job's run (non-streaming, so this is the real ceiling) |
+| `WAIT_TIMEOUT_MS` | `600000` | How long an interactive request waits for a free slot before failing |
+| `DB_PATH` | `/data/jobs.db` | SQLite path for the job queue |
+| `OLDEST_OVERRIDE_MS` | `1800000` | Age at which the drainer force-switches to the oldest starved model |
+| `DRAIN_MAX_MS` | `600000` | Max time the drainer sticks to one model before re-picking |
+| `DONE_RETENTION_MS` | `604800000` | How long a `done`/`dead` job row is kept before purge |
+| `NTFY_URL` | *(unset)* | ntfy topic URL for dead-job alerts |
+| `NTFY_TOKEN` | *(unset)* | ntfy auth token |
 
 ### Docker
 
@@ -44,63 +46,85 @@ node router.js
 docker compose up -d llm-router
 ```
 
-Config lives in `homelab/services/llm-router/.env`.
+Config lives in `homelab/apps/llm-router/.env` (see `.env.example`); job
+queue state persists in the mounted `state/llm-router/jobs.db`.
+
+### Architecture in one paragraph
+
+The router keeps a live pool of backends (`src/pool.js`), polled on an
+interval (`src/discovery.js`) for their model list, loaded model (when the
+backend is llama-swap and reports `/running`), and per-model slot counts.
+Every request needing a backend goes through a leaser (`src/lease.js`) that
+acquires a slot for `(backend, model)`; interactive requests get priority
+over the batch lane when both want the same slot. Interactive traffic
+(`/v1/*`) is proxied straight through, streamed, with a slot held for the
+duration. Batch traffic goes through `/jobs`, is persisted to SQLite
+(`src/queue.js`), and worked off model-by-model by a drainer
+(`src/drain.js`) so a big model loads once per drain window, not once per
+job.
 
 ### API
 
-The router is a transparent Ollama proxy — any Ollama-compatible client works.
-
 ```bash
-# health + backend status
+# health + backend/tier summary
 curl http://localhost:8080/health
 
-# merged model list across all backends
-curl http://localhost:8080/api/models/all
+# merged model list (OpenAI-style)
+curl http://localhost:8080/v1/models
 
-# generate
-curl http://localhost:8080/api/generate \
-  -d '{"model":"qwen3:8b","prompt":"what is a mutex","stream":false}'
+# interactive chat (OpenAI-compatible)
+curl http://localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"what is a mutex"}]}'
 
-# chat
-curl http://localhost:8080/api/chat \
-  -d '{
-    "model": "qwen3:8b",
-    "stream": false,
-    "messages": [
-      {"role": "system", "content": "you are a code assistant"},
-      {"role": "user", "content": "what is a mutex"}
-    ]
-  }'
+# submit a batch job (returns immediately with an id)
+curl -X POST http://localhost:8080/jobs \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen3:8b","request":{"messages":[{"role":"user","content":"say ok"}]}}'
+
+# poll a job
+curl http://localhost:8080/jobs/<id>
+
+# pool + queue status
+curl http://localhost:8080/status
 ```
 
-**From code:**
+Interactive (`/v1/*`) responses include an `x-llm-router-backend` header
+indicating which backend handled the request. A request that wants to run
+batch-shaped work directly against `/v1/*` (bypassing the queue) but not
+count against `/idle`'s quiet window should send `x-llm-router-batch: 1`.
 
-```python
-import ollama
-client = ollama.Client(host="http://localhost:8080")
-res = client.chat(model="qwen3:8b", messages=[{"role":"user","content":"hello"}])
+**`POST /jobs` body:** `{model: string, request: object, priority?: number,
+callback?: string, dedupe_key?: string}`. `request` is the OpenAI-style
+request body (`messages` for chat, `input` for embeddings — detected by
+which field is present). `dedupe_key` collapses a resubmit of the same
+logical job while one with that key is `pending`/`running`. `callback`, if
+given, is POSTed the finished job on completion.
+
+**Job lifecycle:** `pending` → `running` → `done` or, after retrying through
+`retryDelaysMs` (30s, 2m, 10m), `dead`.
+
+### `/status`
+
+```json
+{
+  "backends": [{"name": "luna", "up": true, "down_since": null, "models": [...], "loaded": [...], "slots": {...}, "inflight": {...}}],
+  "queue": {"counts": {"pending": 0, "running": 0, "done": 1, "dead": 0}, "by_model": [...], "oldest_pending_age_s": null},
+  "draining": null
+}
 ```
 
-```js
-import { Ollama } from "ollama";
-const ollama = new Ollama({ host: "http://localhost:8080" });
-const res = await ollama.chat({ model: "qwen3:8b", messages: [{ role: "user", content: "hello" }] });
-```
-
-```bash
-# ollama CLI
-OLLAMA_HOST=http://localhost:8080 ollama run qwen3:8b
-```
-
-Responses include an `x-llm-router-backend` header indicating which machine handled the request.
-
-### Idle endpoint
+### `/idle`
 
 ```bash
 curl http://localhost:8080/idle
 ```
 
-Returns `{ idle, inFlight, idleSeconds, quietWindowMs }`, reflecting whether the router has had no real requests in flight or received recently within `IDLE_WINDOW_MS`. Requests sent with header `x-llm-router-batch: 1` are excluded from idle tracking, so a batch-job consumer polling its own traffic doesn't mask true idleness.
+Returns `{ idle, inFlight, idleSeconds, quietWindowMs }` — true once no
+interactive request is in flight and none has arrived for `IDLE_WINDOW_MS`.
+Batch traffic (through `/jobs`, or `/v1/*` tagged `x-llm-router-batch: 1`)
+never counts toward this, so a batch consumer polling its own work doesn't
+mask true idleness.
 
 ---
 
@@ -160,4 +184,6 @@ export RLLM_MODEL=qwen2.5-coder:14b         # pin a default model
 
 ### How model selection works
 
-Without `RLLM_MODEL` set, `rllm` fetches the model list from the router and picks the one with the highest parameter count in its name (e.g. `qwen3:32b` beats `qwen3:8b`). Override with `-m` or `RLLM_MODEL`.
+Without `RLLM_MODEL` set, `rllm` fetches the model list from `/v1/models`
+and picks the one with the highest parameter count in its name (e.g.
+`qwen3:32b` beats `qwen3:8b`). Override with `-m` or `RLLM_MODEL`.
