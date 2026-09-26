@@ -5,6 +5,8 @@ services:
       context: .
     init: true
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
     environment:
       - PORT=8080
       - BACKENDS_JSON=${LLM_ROUTER_BACKENDS_JSON}
