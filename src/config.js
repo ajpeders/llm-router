@@ -26,6 +26,9 @@ function loadConfig(env = process.env) {
     defaultSlots: int(env, "DEFAULT_SLOTS", 2),
     firstByteTimeoutMs: int(env, "FIRST_BYTE_TIMEOUT_MS", 120000),
     idleTimeoutMs: int(env, "IDLE_TIMEOUT_MS", 60000),
+    // Quiet window /idle uses to decide the router itself is idle (no in-flight
+    // interactive request and no activity for at least this long).
+    idleWindowMs: int(env, "IDLE_WINDOW_MS", 120000),
     // A batch reply is non-streaming: the backend sends nothing until the whole
     // answer is ready, so this is the real total cap for a batch job's run.
     batchTimeoutMs: int(env, "BATCH_TIMEOUT_MS", 30 * 60000),

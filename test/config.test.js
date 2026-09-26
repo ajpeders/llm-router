@@ -12,6 +12,7 @@ test("defaults match the spec", () => {
   assert.strictEqual(c.downAfterFails, 3);
   assert.strictEqual(c.firstByteTimeoutMs, 120000);
   assert.strictEqual(c.idleTimeoutMs, 60000);
+  assert.strictEqual(c.idleWindowMs, 120000);
   assert.strictEqual(c.batchTimeoutMs, 30 * 60000);
   assert.strictEqual(c.oldestOverrideMs, 30 * 60000);
   assert.strictEqual(c.drainMaxMs, 10 * 60000);
@@ -22,6 +23,7 @@ test("defaults match the spec", () => {
 
 test("env overrides ints", () => {
   assert.strictEqual(loadConfig({ BACKENDS_JSON: B, POLL_MS: "500" }).pollMs, 500);
+  assert.strictEqual(loadConfig({ BACKENDS_JSON: B, IDLE_WINDOW_MS: "50" }).idleWindowMs, 50);
 });
 
 test("rejects bad backends", () => {

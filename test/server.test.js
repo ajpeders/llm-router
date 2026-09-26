@@ -15,7 +15,7 @@ async function setup() {
     });
   });
   await new Promise((r) => backend.listen(0, "127.0.0.1", r));
-  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 200, firstByteTimeoutMs: 1000, idleTimeoutMs: 1000 };
+  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 200, firstByteTimeoutMs: 1000, idleTimeoutMs: 1000, idleWindowMs: 50 };
   const pool = new Pool(["luna"], 2);
   pool.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 2 } });
   const leaser = new Leaser(pool);
@@ -134,6 +134,69 @@ test("client aborts while waiting for a slot: slot isn't leaked, upstream never 
 
   assert.strictEqual(pool.inflight(pool.backends.get("luna"), "m"), 0);
   assert.strictEqual(backendHits, 0);
+
+  server.close();
+  backend.close();
+});
+
+test("/idle: idle when quiet, not idle in flight, batch-tagged excluded, idle returns after the window", async () => {
+  let releaseBackend;
+  const backend = http.createServer((req, res) => {
+    let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => {
+      releaseBackend = () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ served: JSON.parse(b).model }));
+      };
+    });
+  });
+  await new Promise((r) => backend.listen(0, "127.0.0.1", r));
+  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 1000, firstByteTimeoutMs: 5000, idleTimeoutMs: 5000, idleWindowMs: 50 };
+  const pool = new Pool(["luna"], 2);
+  pool.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 2 } });
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  const server = createServer({ cfg, pool, leaser, queue, drainer: { current: null } });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  // Freshly started, no traffic yet: quiet window (activity timestamp 0) is already
+  // well past, and nothing is in flight, so idle should read true.
+  assert.strictEqual((await (await fetch(`${base}/idle`)).json()).idle, true);
+
+  // Kick off an interactive request but don't let the backend answer yet: while it's
+  // in flight, /idle must report not-idle regardless of the quiet window.
+  const inflight = post(`${base}/v1/chat/completions`, { model: "m" });
+  await new Promise((r) => setTimeout(r, 20));
+  const whileInFlight = await (await fetch(`${base}/idle`)).json();
+  assert.strictEqual(whileInFlight.idle, false);
+  assert.strictEqual(whileInFlight.inFlight, 1);
+  releaseBackend();
+  await inflight;
+
+  // Right after it finishes, still inside the quiet window.
+  const justAfter = await (await fetch(`${base}/idle`)).json();
+  assert.strictEqual(justAfter.idle, false);
+  assert.strictEqual(justAfter.inFlight, 0);
+
+  // A batch-tagged request must not mark activity or count toward in-flight.
+  await new Promise((r) => setTimeout(r, 60)); // clear the quiet window from the prior request
+  const batchReq = fetch(`${base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-llm-router-batch": "1" },
+    body: JSON.stringify({ model: "m" }),
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  const duringBatch = await (await fetch(`${base}/idle`)).json();
+  assert.strictEqual(duringBatch.inFlight, 0);
+  assert.strictEqual(duringBatch.idle, true);
+  releaseBackend();
+  await batchReq;
+
+  // After the quiet window elapses again with nothing in flight, idle returns.
+  await new Promise((r) => setTimeout(r, 60));
+  const after = await (await fetch(`${base}/idle`)).json();
+  assert.strictEqual(after.idle, true);
+  assert.strictEqual(after.quietWindowMs, 50);
 
   server.close();
   backend.close();
