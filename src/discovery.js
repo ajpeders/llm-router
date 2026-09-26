@@ -6,7 +6,9 @@ async function defaultFetchJson(url, timeoutMs) {
   return res.json();
 }
 
-async function pollBackend(baseUrl, fetchJson) {
+// slotsCache is an optional Map<model, count> reused (and mutated) across polls of the
+// same backend, so a model whose count is already known is never re-fetched.
+async function pollBackend(baseUrl, fetchJson, slotsCache = new Map()) {
   const list = await fetchJson(`${baseUrl}/v1/models`);
   const models = (list.data || []).map((m) => m.id).sort();
 
@@ -20,9 +22,12 @@ async function pollBackend(baseUrl, fetchJson) {
 
   const slots = {};
   for (const m of loaded || []) {
+    if (slotsCache.has(m)) { slots[m] = slotsCache.get(m); continue; }
+    // GET /upstream/<m>/slots can itself start `m` on llama-swap — only worth the risk
+    // once per model, ever; the cached value is reused on every later poll.
     try {
       const s = await fetchJson(`${baseUrl}/upstream/${m}/slots`);
-      if (Array.isArray(s) && s.length > 0) slots[m] = s.length;
+      if (Array.isArray(s) && s.length > 0) { slots[m] = s.length; slotsCache.set(m, s.length); }
     } catch {
       // capacity falls back to cfg.defaultSlots
     }
@@ -32,19 +37,33 @@ async function pollBackend(baseUrl, fetchJson) {
 
 function startDiscovery({ cfg, pool, leaser, fetchJson }) {
   const get = fetchJson || ((url) => defaultFetchJson(url, cfg.pollTimeoutMs));
+  // Slot counts are cached per backend+model forever once fetched: re-fetching
+  // /upstream/<model>/slots on every poll can itself start that model on llama-swap,
+  // which is exactly the load-on-discovery bug this cache exists to avoid.
+  const slotsCaches = new Map(Object.keys(cfg.backends).map((name) => [name, new Map()]));
+  let inFlight = false;
 
   async function pollOnce() {
-    await Promise.all(
-      Object.entries(cfg.backends).map(async ([name, url]) => {
-        try {
-          pool.applyPoll(name, await pollBackend(url, get));
-        } catch (err) {
-          pool.applyFailure(name, cfg.downAfterFails);
-          console.log(`[llm-router] poll ${name} failed: ${err.message}`);
-        }
-      })
-    );
-    leaser.notify();
+    // A poll can take longer than pollMs (a slow/hanging backend); skip a scheduled
+    // tick that lands while the previous one is still running rather than stacking
+    // concurrent polls of the same backends.
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      await Promise.all(
+        Object.entries(cfg.backends).map(async ([name, url]) => {
+          try {
+            pool.applyPoll(name, await pollBackend(url, get, slotsCaches.get(name)));
+          } catch (err) {
+            pool.applyFailure(name, cfg.downAfterFails);
+            console.log(`[llm-router] poll ${name} failed: ${err.message}`);
+          }
+        })
+      );
+      leaser.notify();
+    } finally {
+      inFlight = false;
+    }
   }
 
   const timer = setInterval(pollOnce, cfg.pollMs);
