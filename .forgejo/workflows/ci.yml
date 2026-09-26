@@ -16,4 +16,4 @@ jobs:
           node --check cli.js
           node --check rllm
       - name: tests
-        run: node --test test/
+        run: node --test 'test/*.test.js'

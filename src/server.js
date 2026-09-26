@@ -22,18 +22,19 @@ function parseJson(buf) {
 
 function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now }) {
   return http.createServer(async (req, res) => {
-    const path = new URL(req.url, "http://router.local").pathname;
     try {
+      const path = new URL(req.url, "http://router.local").pathname;
+      const tier = Object.keys(cfg.backends);
       if (req.method === "GET" && path === "/health") {
         const backends = {};
         for (const b of pool.backends.values()) backends[b.name] = b.models.size;
-        return send(res, 200, { ok: true, backends });
+        return send(res, 200, { ok: true, tier, backends });
       }
       if (req.method === "GET" && path === "/api/models/all") {
         const by_backend = {};
         for (const b of pool.backends.values()) by_backend[b.name] = [...b.models].sort();
         const models = pool.allModels();
-        return send(res, 200, { ok: true, total_models: models.length, models, by_backend });
+        return send(res, 200, { ok: true, tier, total_models: models.length, models, by_backend });
       }
       if (req.method === "GET" && path === "/status") {
         const age = queue.oldestPendingAgeMs(now());
@@ -48,7 +49,10 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now }) {
       }
       if (req.method === "POST" && path === "/jobs") {
         const b = parseJson(await readBody(req));
-        if (!b || typeof b.model !== "string" || !b.request || typeof b.request !== "object") {
+        const badCallback = b && b.callback !== undefined && b.callback !== null &&
+          (typeof b.callback !== "string" || !/^https?:\/\//.test(b.callback));
+        const badDedupe = b && b.dedupe_key !== undefined && b.dedupe_key !== null && typeof b.dedupe_key !== "string";
+        if (!b || typeof b.model !== "string" || !b.request || typeof b.request !== "object" || badCallback || badDedupe) {
           return send(res, 400, { error: "bad_job", hint: "{model: string, request: object, priority?, callback?, dedupe_key?}" });
         }
         const r = queue.submit(
@@ -72,6 +76,14 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now }) {
         } catch (err) {
           if (err.message === "no_backend") return send(res, 404, { error: "unknown_model", model });
           return send(res, 503, { error: "busy", detail: err.message });
+        }
+        // req.destroyed is not a useful signal here: an IncomingMessage auto-destroys
+        // once its body has been fully read (readBody above), which happens on every
+        // normal request, not just an aborted one. The socket is the real signal for
+        // "the client is actually gone."
+        if (res.destroyed || !res.socket || res.socket.destroyed) {
+          leaser.release(backend, model);
+          return;
         }
         try {
           await proxyStream({ req, res, body, baseUrl: cfg.backends[backend], firstByteTimeoutMs: cfg.firstByteTimeoutMs, idleTimeoutMs: cfg.idleTimeoutMs });
