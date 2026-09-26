@@ -2,6 +2,22 @@
 const http = require("node:http");
 const https = require("node:https");
 
+// Hop-by-hop headers must never be forwarded as-is between a client and an upstream:
+// they describe the connection itself, not the resource, and stale values from one
+// leg (e.g. a chunked client request re-sent with a fixed content-length) make the
+// other leg's parser reject the message outright.
+const HOP_BY_HOP_HEADERS = [
+  "connection", "keep-alive", "transfer-encoding", "te", "trailer",
+  "upgrade", "proxy-authorization", "proxy-connection", "expect",
+];
+
+function stripHopByHop(headers, extra = []) {
+  const h = { ...headers };
+  for (const k of HOP_BY_HOP_HEADERS) delete h[k];
+  for (const k of extra) delete h[k];
+  return h;
+}
+
 // One upstream request with a first-byte timer that becomes an idle timer after the
 // response headers arrive. There is deliberately no total cap: long agent turns stream
 // for many minutes, and a fixed cap was why the old router got retired.
@@ -13,6 +29,9 @@ function request({ baseUrl, method, path, headers, body, firstByteTimeoutMs, idl
 
   const req = client.request(target, { method, headers }, (res) => {
     arm(idleTimeoutMs, "upstream_timeout");
+    // Re-arms on every chunk *consumed* here, not on the wire — if the client reads
+    // slowly and backpressure stalls upRes.pipe(res), no data event fires and this
+    // idle timer still trips, which is the intended behavior.
     res.on("data", () => arm(idleTimeoutMs, "upstream_timeout"));
     res.on("end", () => clearTimeout(timer));
     res.on("error", (err) => { clearTimeout(timer); onError(err, true); });
@@ -27,16 +46,15 @@ function request({ baseUrl, method, path, headers, body, firstByteTimeoutMs, idl
 
 function proxyStream({ req, res, body, baseUrl, firstByteTimeoutMs, idleTimeoutMs }) {
   return new Promise((resolve) => {
-    const headers = { ...req.headers };
-    delete headers.host;
-    delete headers.connection;
+    const headers = stripHopByHop(req.headers, ["host"]);
+    // The body is already fully buffered, so content-length is always correct here —
+    // any transfer-encoding the client sent is stripped above.
     headers["content-length"] = String(body.length);
 
     const up = request({
       baseUrl, method: req.method, path: req.url, headers, body, firstByteTimeoutMs, idleTimeoutMs,
       onResponse: (upRes) => {
-        const h = { ...upRes.headers };
-        delete h.connection;
+        const h = stripHopByHop(upRes.headers);
         res.writeHead(upRes.statusCode || 502, h);
         upRes.pipe(res);
         upRes.on("end", resolve);
