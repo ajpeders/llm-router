@@ -14,14 +14,14 @@ const pool = new Pool(Object.keys(cfg.backends), cfg.defaultSlots);
 const leaser = new Leaser(pool);
 const queue = new Queue(cfg.dbPath);
 const recovered = queue.recoverRunning(Date.now());
-// Shared: the server records interactive traffic, the drainer reads it to decide
-// whether batch may use a 1-slot model's only slot.
+// Shared: the server records interactive traffic, the drainer reads it to hold batch
+// off until BATCH_HOLDOFF_MS after the last interactive request.
 const idleTracker = createIdleTracker(cfg.idleWindowMs);
 
 const drainer = new Drainer({
   queue, leaser, pool, cfg,
   runJob: makeRunJob(cfg),
-  isInteractiveIdle: () => idleTracker.snapshot(Date.now()).idle,
+  isInteractiveIdle: () => idleTracker.idleFor(Date.now(), cfg.batchHoldoffMs),
   onFinished: async (job) => {
     await deliverCallback(job);
     if (job.status === "dead") await alertDead(job, cfg);

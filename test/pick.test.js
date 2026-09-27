@@ -75,11 +75,11 @@ test("1-slot model: batch takes the only slot while interactive is idle, waits o
   assert.deepStrictEqual(pickBackend(q, "big", "batch", { interactiveIdle: true }), { backend: "luna" });
 });
 
-test("2-slot model: batch still keeps one slot back even when interactive is idle", () => {
+test("2-slot model: batch uses every slot while idle, keeps one back otherwise", () => {
   const p = new Pool(["mac"], 2);
   p.applyPoll("mac", { models: ["small"], loaded: ["small"], slots: { small: 2 } });
-  assert.deepStrictEqual(pickBackend(p, "small", "batch", { interactiveIdle: true }), { backend: "mac" });
   p.acquire("mac", "small");
-  assert.deepStrictEqual(pickBackend(p, "small", "batch", { interactiveIdle: true }), { wait: true });
+  assert.deepStrictEqual(pickBackend(p, "small", "batch", { interactiveIdle: true }), { backend: "mac" });
+  assert.deepStrictEqual(pickBackend(p, "small", "batch", { interactiveIdle: false }), { wait: true });
   assert.strictEqual(p.batchServable("small", false), true);
 });

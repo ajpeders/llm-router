@@ -71,8 +71,9 @@ Two CLIs ship alongside it:
 1. `POST /jobs` validates `{model, request, priority?, callback?,
    dedupe_key?}`, and inserts a `pending` row (or returns the existing job's
    id if `dedupe_key` matches one still `pending`/`running`).
-2. The drainer's `tick()` (called after every discovery poll and every job
-   completion) picks one model to work off — the one with the most pending
+2. The drainer's `tick()` (called every second and after every job
+   completion) does nothing while batch is paused (see Key decisions), and
+   otherwise picks one model to work off — the one with the most pending
    jobs, unless something has been waiting past `OLDEST_OVERRIDE_MS`, in
    which case that starved model wins outright — and claims/runs jobs for it
    until no more capacity or no more pending jobs for that model.
@@ -121,10 +122,15 @@ Two CLIs ship alongside it:
 - **Interactive always outranks batch for a contested slot.** `Leaser.notify`
   resolves interactive waiters before batch waiters regardless of queue
   order, so a live chat request never waits behind a queued batch job.
-- **The batch lane always reserves capacity, never claims the last slot.**
-  `Pool.batchServable` requires `capacity - 1 > 0` — a 1-slot model is
-  structurally unservable by batch, so those jobs simply stay pending rather
-  than starving interactive traffic.
+- **Batch yields to interactive by pausing and preempting, not by sharing.**
+  The drainer claims nothing while an interactive request is in flight or
+  one arrived within `BATCH_HOLDOFF_MS`, and each untagged interactive
+  request calls `Drainer.preempt()`, which aborts in-flight jobs through an
+  `AbortController` (dropping the upstream connection stops llama-server
+  generating) and `Queue.requeue`s them with the attempt refunded. Because
+  batch only ever runs while interactive is quiet, it may use a model's full
+  slot count (`batchReserve` still holds one slot back if batch is ever asked
+  for while interactive is active).
 - **Batch drains one model at a time.** Loading a model onto a backend
   (especially via llama-swap) is expensive; grouping by model amortizes that
   cost across every pending job for it instead of paying it per job.

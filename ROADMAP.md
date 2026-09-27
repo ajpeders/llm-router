@@ -8,14 +8,19 @@
   `jobs.db` state, and `bin/monitor` alerting on a down backend or a stale
   queue.
 
+- [x] Interactive preempts batch (2026-09-27): batch pauses while
+  interactive `/v1` traffic is active and for `BATCH_HOLDOFF_MS` (30 min)
+  after it; running jobs are aborted and requeued without burning an attempt.
+  Batch may now use every slot (incl. 1-slot models) while quiet.
+
 ## Next
 
 - [ ] **Mac llama-swap backend.** `mac` is already in `BACKENDS_JSON` but has
   no llama-swap set up yet — bring it up so the router has a real second
   backend, not just luna.
-- [ ] **Raise luna's `qwen3-coder:30b` to `--parallel 2`.** Currently 1 slot;
-  a batch job can never get a slot alongside an interactive one on it (see
-  `Pool.batchServable`'s `capacity - 1 > 0` guard).
+- [ ] **Raise luna's `qwen3-coder:30b` to `--parallel 2`.** Currently 1 slot,
+  so two concurrent interactive requests serialize (batch no longer needs a
+  spare slot — it only runs while interactive is quiet).
 - [ ] **Pilot clients**: point watcher, jobsearch, digest, and Hermes at the
   router's `/v1` and `/jobs` instead of hitting a backend directly.
 - [ ] **Migrate the remaining Ollama-API consumers** off `/api/generate` /

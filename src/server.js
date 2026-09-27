@@ -53,6 +53,7 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now, idleT
           backends: pool.snapshot(),
           queue: { counts: queue.counts(), by_model: queue.pendingByModel(now()), oldest_pending_age_s: age === null ? null : Math.floor(age / 1000) },
           draining: drainer.current,
+          batch_paused: drainer.paused ?? false,
         });
       }
       if (req.method === "GET" && path === "/v1/models") {
@@ -82,6 +83,9 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now, idleT
         if (!isBatch) {
           idleTracker.begin();
           idleTracker.markActivity(now());
+          // Interactive always wins: stop batch now rather than make this request wait
+          // behind a job that can run for up to BATCH_TIMEOUT_MS.
+          drainer.preempt?.();
         }
         try {
           const body = await readBody(req);

@@ -114,6 +114,22 @@ Add `"priority": 1` to jump ahead of same-model jobs at the default priority,
 `pending`/`running`, or `"callback": "http://..."` to have the finished job
 POSTed back instead of polling.
 
+## Let an agent (e.g. Hermes) queue batch work
+
+Have it `POST /jobs` as above — submitting never waits on or disturbs the
+interactive lane. Jobs run when their model is servable and nobody has made
+an interactive `/v1` request for `BATCH_HOLDOFF_MS` (30 min by default); your
+own interactive requests abort running jobs and requeue them. Check whether
+batch is currently held off:
+
+```bash
+curl -s http://localhost:8080/status | grep -o '"batch_paused":[a-z]*'
+```
+
+If the agent also calls `/v1/*` directly for background work, send
+`x-llm-router-batch: 1` on those calls, or they will pause the queue like
+your own requests do.
+
 ## Diagnose a backend that isn't receiving traffic
 
 1. `curl http://localhost:8080/status` — if a backend shows `"up": false`,

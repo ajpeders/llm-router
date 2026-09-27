@@ -74,10 +74,10 @@ function proxyStream({ req, res, body, baseUrl, firstByteTimeoutMs, idleTimeoutM
   });
 }
 
-function callJson({ baseUrl, path, payload, firstByteTimeoutMs, idleTimeoutMs }) {
+function callJson({ baseUrl, path, payload, firstByteTimeoutMs, idleTimeoutMs, signal }) {
   const body = Buffer.from(JSON.stringify(payload));
   return new Promise((resolve, reject) => {
-    request({
+    const up = request({
       baseUrl, method: "POST", path, body, firstByteTimeoutMs, idleTimeoutMs,
       headers: { "content-type": "application/json", "content-length": String(body.length) },
       onResponse: (res) => {
@@ -92,6 +92,11 @@ function callJson({ baseUrl, path, payload, firstByteTimeoutMs, idleTimeoutMs })
       },
       onError: (err) => reject(err),
     });
+    // Preemption: dropping the connection is what makes llama-server stop generating.
+    if (signal) {
+      const abort = () => up.destroy(new Error("preempted"));
+      if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true });
+    }
   });
 }
 

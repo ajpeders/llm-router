@@ -37,6 +37,9 @@ function loadConfig(env = process.env) {
     // A batch reply is non-streaming: the backend sends nothing until the whole
     // answer is ready, so this is the real total cap for a batch job's run.
     batchTimeoutMs: int(env, "BATCH_TIMEOUT_MS", 30 * 60000),
+    // Batch is paused while any interactive request is in flight and until this long
+    // after the last one, so a coding session isn't interleaved with batch jobs.
+    batchHoldoffMs: int(env, "BATCH_HOLDOFF_MS", 30 * 60000),
     waitTimeoutMs: int(env, "WAIT_TIMEOUT_MS", 600000),
     dbPath: env.DB_PATH || "/data/jobs.db",
     oldestOverrideMs: int(env, "OLDEST_OVERRIDE_MS", 30 * 60000),

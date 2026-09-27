@@ -94,6 +94,13 @@ class Queue {
     return "pending";
   }
 
+  // A preempted run isn't the job's fault: back to pending, attempt not counted.
+  requeue(id, now) {
+    this.db
+      .prepare("UPDATE jobs SET status = 'pending', attempts = attempts - 1, updated_at = ?, next_run_at = ? WHERE id = ? AND status = 'running'")
+      .run(now, now, id);
+  }
+
   recoverRunning(now) {
     return Number(this.db.prepare("UPDATE jobs SET status = 'pending', updated_at = ? WHERE status = 'running'").run(now).changes);
   }

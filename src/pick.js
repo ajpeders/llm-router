@@ -6,13 +6,12 @@ const byName = (a, b) => a.name.localeCompare(b.name);
 // → wait. Loading is only allowed on an idle backend: on llama-swap a load evicts the
 // resident model, which would kill its in-flight requests and defeat model grouping.
 //
-// Batch reserves one slot per backend+model for interactive traffic — except where the
-// model has exactly 1 slot (luna's big --parallel 1 models): there batch may take it,
-// but only while the interactive lane is idle (opts.interactiveIdle). Otherwise such a
-// model could never run a batch job at all.
+// Batch reserves one slot per backend+model for interactive traffic unless the
+// interactive lane is idle (opts.interactiveIdle). The drainer only claims while idle,
+// and an arriving interactive request preempts running batch jobs, so an idle batch
+// lane may use every slot — including a 1-slot model's only one.
 function batchReserve(capacity, lane, opts) {
-  if (lane !== "batch") return 0;
-  return capacity === 1 && opts.interactiveIdle ? 0 : 1;
+  return lane === "batch" && !opts.interactiveIdle ? 1 : 0;
 }
 
 function pickBackend(pool, model, lane, opts = {}) {

@@ -43,19 +43,42 @@ test("interleaved jobs for two models load each model once", async () => {
   assert.strictEqual(queue.counts().done, 6);
 });
 
-test("single-slot model is never batch-servable; other models still drain", async () => {
+test("nothing drains while the interactive lane is active, any model or slot count", async () => {
   const pool = new Pool(["luna"], 2);
   pool.applyPoll("luna", { models: ["A", "B"], loaded: ["A", "B"], slots: { A: 1, B: 3 } });
   const leaser = new Leaser(pool);
   const queue = new Queue(":memory:");
   queue.submit({ model: "A", request: {} }, 0);
-  queue.submit({ model: "A", request: {} }, 0);
-  queue.submit({ model: "A", request: {} }, 0);
   queue.submit({ model: "B", request: {} }, 0);
-  const d = new Drainer({ queue, leaser, pool, cfg, runJob: async () => ({}), onFinished: async () => {}, now: () => 1 });
+  let idle = false;
+  const d = new Drainer({ queue, leaser, pool, cfg, runJob: async () => ({}), onFinished: async () => {}, now: () => 1, isInteractiveIdle: () => idle });
+  assert.strictEqual(d.paused, true);
+  for (let i = 0; i < 3; i++) { d.tick(); await d.idle(); }
+  assert.strictEqual(queue.counts().pending, 2);
+  idle = true;
   for (let i = 0; i < 5; i++) { d.tick(); await d.idle(); }
-  assert.strictEqual(queue.counts().done, 1, "B's job must complete");
-  assert.strictEqual(queue.counts().pending, 3, "A's jobs stay pending forever — 1 slot leaves no batch capacity");
+  assert.strictEqual(queue.counts().done, 2);
+});
+
+test("preempt aborts in-flight jobs, requeues them without burning an attempt, frees the slot", async () => {
+  const pool = new Pool(["luna"], 2);
+  pool.applyPoll("luna", { models: ["A"], loaded: ["A"], slots: { A: 1 } });
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  const id = queue.submit({ model: "A", request: {} }, 0).id;
+  let idle = true;
+  const runJob = (job, backend, signal) => new Promise((_, reject) => signal.addEventListener("abort", () => reject(new Error("preempted"))));
+  const d = new Drainer({ queue, leaser, pool, cfg, runJob, onFinished: async () => {}, now: () => 1, isInteractiveIdle: () => idle });
+  d.tick();
+  assert.strictEqual(queue.get(id).status, "running");
+  idle = false; // an interactive request arrived
+  assert.strictEqual(d.preempt(), 1);
+  const got = leaser.acquire("A", "interactive", 1000); // waits for the batch slot
+  await d.idle();
+  assert.strictEqual(await got, "luna", "interactive gets the slot the batch job held");
+  const j = queue.get(id);
+  assert.strictEqual(j.status, "pending");
+  assert.strictEqual(j.attempts, 0, "a preempted run is not an attempt");
 });
 
 // interactiveWaiting is a GLOBAL pause, not a per-model capacity check: an interactive
@@ -200,4 +223,41 @@ test("integration: interactive traffic holds a 1-slot batch job until the idle w
   t += 100;
   d.tick(); await d.idle();
   assert.strictEqual(queue.get(id).status, "done", "after the window: batch runs");
+});
+
+test("integration: holdoff keeps batch paused until BATCH_HOLDOFF_MS after the last interactive request", async () => {
+  let t = 10000;
+  const holdoff = 30 * 60000;
+  const tracker = createIdleTracker(100);
+  const pool = new Pool(["luna"], 2);
+  pool.applyPoll("luna", { models: ["A"], loaded: ["A"], slots: { A: 2 } });
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  const id = queue.submit({ model: "A", request: {} }, 0).id;
+  const d = new Drainer({
+    queue, leaser, pool, cfg, runJob: async () => ({}), onFinished: async () => {}, now: () => t,
+    isInteractiveIdle: () => tracker.idleFor(t, holdoff),
+  });
+  tracker.begin(); tracker.markActivity(t); tracker.end();
+  t += holdoff - 1000;
+  d.tick(); await d.idle();
+  assert.strictEqual(queue.get(id).status, "pending", "inside the holdoff: paused even though /idle's window passed");
+  assert.strictEqual(tracker.snapshot(t).idle, true);
+  t += 2000;
+  d.tick(); await d.idle();
+  assert.strictEqual(queue.get(id).status, "done", "holdoff elapsed: batch resumes");
+});
+
+test("makeRunJob: aborting the signal drops the upstream call", async () => {
+  const up = http.createServer(() => {}); // never responds
+  await new Promise((r) => up.listen(0, "127.0.0.1", r));
+  try {
+    const runJob = makeRunJob({ backends: { luna: `http://127.0.0.1:${up.address().port}` }, idleTimeoutMs: 5000, batchTimeoutMs: 5000 });
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 20);
+    await assert.rejects(runJob({ model: "m", request: { messages: [] } }, "luna", ctl.signal), /preempted/);
+  } finally {
+    up.closeAllConnections();
+    up.close();
+  }
 });

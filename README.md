@@ -32,6 +32,7 @@ node router.js
 | `NONSTREAM_TIMEOUT_MS` | `1800000` | Interactive-lane timeout for a request with `stream != true` — its headers only arrive once generation is fully done, so it needs the same long cap as a batch job |
 | `IDLE_TIMEOUT_MS` | `60000` | Stream idle timeout (interactive and batch) |
 | `IDLE_WINDOW_MS` | `120000` | Quiet window with no real requests before `/idle` reports idle |
+| `BATCH_HOLDOFF_MS` | `1800000` | Batch is paused while any interactive `/v1` request is in flight and until this long after the last one |
 | `BATCH_TIMEOUT_MS` | `1800000` | Total cap for a batch job's run (non-streaming, so this is the real ceiling) |
 | `WAIT_TIMEOUT_MS` | `600000` | How long an interactive request waits for a free slot before failing |
 | `DB_PATH` | `/data/jobs.db` | SQLite path for the job queue |
@@ -64,13 +65,21 @@ duration. Batch traffic goes through `/jobs`, is persisted to SQLite
 (`src/drain.js`) so a big model loads once per drain window, not once per
 job.
 
-The batch lane keeps one slot per backend and model free for interactive
-traffic, so it uses at most capacity − 1. The one exception is a model with
-exactly **1** slot (luna's big models run `--parallel 1`): batch may take that
-single slot, but only while the interactive lane is idle (no interactive
-`/v1` request in flight and none within `IDLE_WINDOW_MS`, as reported by
-`/idle`). The cost is that an interactive request arriving mid-job waits for
-that batch job to finish (up to `WAIT_TIMEOUT_MS`, then 503).
+**Interactive always wins.** Batch jobs queue up and wait while no backend
+can serve their model, and run once one can — but only while the
+interactive lane is quiet: no interactive `/v1` request in flight and none
+within `BATCH_HOLDOFF_MS` (default 30 min). While quiet, batch may use every
+slot, including a 1-slot model's only one. An interactive request arriving
+mid-batch **preempts** it: every running batch job is aborted and requeued
+as `pending` (the aborted run doesn't count toward its retries), the request
+gets the slot immediately, and batch stays paused until the holdoff has
+elapsed since the *last* interactive request. The trade-off is that the
+aborted jobs' partial generation is thrown away and redone later. `/status`
+reports `batch_paused`.
+
+Automation that submits `/jobs` (e.g. Hermes) never pauses the queue. If it
+also calls `/v1/*` directly for work that isn't urgent, tag those calls
+`x-llm-router-batch: 1` so they don't count as interactive either.
 
 ### API
 
