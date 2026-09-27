@@ -12,6 +12,9 @@
   interactive `/v1` traffic is active and for `BATCH_HOLDOFF_MS` (10 min)
   after it; running jobs are aborted and requeued without burning an attempt.
   Batch may now use every slot (incl. 1-slot models) while quiet.
+- [x] Context-aware routing (2026-09-27): per-backend `n_ctx` discovery,
+  requests skip backends too small for them; slot/ctx cache now refreshes
+  when a model's llama-swap cmd changes instead of never.
 
 ## Next
 

@@ -6,38 +6,49 @@ async function defaultFetchJson(url, timeoutMs) {
   return res.json();
 }
 
-// slotsCache is an optional Map<model, count> reused (and mutated) across polls of the
-// same backend, so a model whose count is already known is never re-fetched.
+// slotsCache is an optional Map<model, {cmd, slots, ctx}> reused (and mutated) across
+// polls of the same backend. An entry is re-fetched only when llama-swap reports a
+// different launch cmd for the model (its --parallel / --ctx-size may have changed);
+// otherwise it's reused forever. Cached models are reported even while unloaded, so
+// routing still knows a model's slot count and context size when it isn't resident.
 async function pollBackend(baseUrl, fetchJson, slotsCache = new Map()) {
   const list = await fetchJson(`${baseUrl}/v1/models`);
   const models = (list.data || []).map((m) => m.id).sort();
 
-  let loaded = null;
+  let ready = null;
   try {
     const r = await fetchJson(`${baseUrl}/running`);
-    loaded = (r.running || []).filter((x) => x.state === "ready").map((x) => x.model);
+    ready = (r.running || []).filter((x) => x.state === "ready");
   } catch {
-    loaded = null; // not llama-swap (e.g. Ollama): loaded-state unknown
+    ready = null; // not llama-swap (e.g. Ollama): loaded-state unknown
   }
 
-  const slots = {};
-  for (const m of loaded || []) {
-    if (slotsCache.has(m)) { slots[m] = slotsCache.get(m); continue; }
-    // GET /upstream/<m>/slots can itself start `m` on llama-swap — only worth the risk
-    // once per model, ever; the cached value is reused on every later poll.
+  for (const { model: m, cmd = "" } of ready || []) {
+    if (slotsCache.get(m)?.cmd === cmd) continue;
+    // Only ever fetched for a model llama-swap already reports ready: GET
+    // /upstream/<m>/slots on a non-resident model would itself start it.
     try {
       const s = await fetchJson(`${baseUrl}/upstream/${m}/slots`);
-      if (Array.isArray(s) && s.length > 0) { slots[m] = s.length; slotsCache.set(m, s.length); }
+      if (Array.isArray(s) && s.length > 0) {
+        const ctxs = s.map((x) => x.n_ctx).filter(Number.isFinite);
+        slotsCache.set(m, { cmd, slots: s.length, ctx: ctxs.length ? Math.min(...ctxs) : null });
+      }
     } catch {
-      // capacity falls back to cfg.defaultSlots
+      // capacity falls back to cfg.defaultSlots; context size stays unknown
     }
   }
-  return { models, loaded, slots };
+  const slots = {};
+  const ctx = {};
+  for (const [m, e] of slotsCache) {
+    slots[m] = e.slots;
+    if (e.ctx) ctx[m] = e.ctx;
+  }
+  return { models, loaded: ready && ready.map((x) => x.model), slots, ctx };
 }
 
 function startDiscovery({ cfg, pool, leaser, fetchJson }) {
   const get = fetchJson || ((url) => defaultFetchJson(url, cfg.pollTimeoutMs));
-  // Slot counts are cached per backend+model forever once fetched: re-fetching
+  // Slot counts / context sizes are cached per backend+model+launch cmd: re-fetching
   // /upstream/<model>/slots on every poll can itself start that model on llama-swap,
   // which is exactly the load-on-discovery bug this cache exists to avoid.
   const slotsCaches = new Map(Object.keys(cfg.backends).map((name) => [name, new Map()]));

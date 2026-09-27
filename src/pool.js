@@ -13,12 +13,12 @@ class Pool {
     this.backends = new Map(
       names.map((name) => [
         name,
-        { name, up: false, fails: 0, downSince: now(), models: new Set(), loaded: null, slots: new Map(), inflight: new Map() },
+        { name, up: false, fails: 0, downSince: now(), models: new Set(), loaded: null, slots: new Map(), ctx: new Map(), inflight: new Map() },
       ])
     );
   }
 
-  applyPoll(name, { models, loaded, slots }) {
+  applyPoll(name, { models, loaded, slots, ctx = {} }) {
     const b = this.backends.get(name);
     b.up = true;
     b.fails = 0;
@@ -27,6 +27,7 @@ class Pool {
     for (const m of models) this.knownModels.add(m);
     b.loaded = loaded === null ? null : new Set(loaded);
     b.slots = new Map(Object.entries(slots));
+    b.ctx = new Map(Object.entries(ctx));
     this.polledOnce = true;
   }
 
@@ -93,6 +94,7 @@ class Pool {
       models: [...b.models].sort(),
       loaded: b.loaded === null ? null : [...b.loaded].sort(),
       slots: Object.fromEntries(b.slots),
+      ctx: Object.fromEntries(b.ctx),
       inflight: Object.fromEntries(b.inflight),
     }));
   }

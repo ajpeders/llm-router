@@ -261,3 +261,15 @@ test("makeRunJob: aborting the signal drops the upstream call", async () => {
     up.close();
   }
 });
+
+test("batch jobs are routed by context size too", async () => {
+  const pool = new Pool(["big", "small"], 2);
+  pool.applyPoll("big", { models: ["m"], loaded: ["m"], slots: { m: 1 }, ctx: { m: 98304 } });
+  pool.applyPoll("small", { models: ["m"], loaded: ["m"], slots: { m: 4 }, ctx: { m: 1000 } });
+  const queue = new Queue(":memory:");
+  queue.submit({ model: "m", request: { messages: [{ role: "user", content: "x".repeat(20000) }] } }, 0);
+  const ran = [];
+  const d = new Drainer({ queue, leaser: new Leaser(pool), pool, cfg, runJob: async (job, backend) => { ran.push(backend); return {}; }, onFinished: async () => {}, now: () => 1 });
+  d.tick(); await d.idle();
+  assert.deepStrictEqual(ran, ["big"]);
+});

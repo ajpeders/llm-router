@@ -23,7 +23,7 @@ node router.js
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | Listen port |
-| `BACKENDS_JSON` | *(required)* | Backend name → base URL, e.g. `{"luna":"http://100.84.247.20:11434","mac":"http://192.168.0.47:11434"}`. Same model IDs must exist on every backend that serves them. |
+| `BACKENDS_JSON` | *(required)* | Backend name → base URL, e.g. `{"luna":"http://100.84.247.20:11434","mac":"http://192.168.0.47:11434"}`. Same model IDs must exist on every backend that serves them; their context sizes may differ (requests are routed by size). |
 | `DEFAULT_SLOTS` | `2` | Slot count assumed for a model until its backend reports `/upstream/<model>/slots` (llama-swap only) |
 | `POLL_MS` | `10000` | Backend poll interval |
 | `POLL_TIMEOUT_MS` | `4000` | Per-poll timeout |
@@ -64,6 +64,15 @@ duration. Batch traffic goes through `/jobs`, is persisted to SQLite
 (`src/queue.js`), and worked off model-by-model by a drainer
 (`src/drain.js`) so a big model loads once per drain window, not once per
 job.
+
+**Context-aware routing.** The same model can run with different
+`--ctx-size` on different backends (luna's `qwen3.6:35b-a3b` is 98k, the mac's
+is smaller). Discovery reads each loaded model's per-slot `n_ctx` from
+llama-server's `/slots` and re-reads it whenever llama-swap reports a changed
+launch command. A request (interactive or batch) whose estimated size — JSON
+characters ÷ 3, deliberately high — exceeds a backend's context skips that
+backend and waits for one that fits; if none is known to fit, it goes to the
+largest. `/status` shows each backend's `ctx`.
 
 **Interactive always wins.** Batch jobs queue up and wait while no backend
 can serve their model, and run once one can — but only while the

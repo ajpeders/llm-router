@@ -332,3 +332,26 @@ test("an interactive /v1 request preempts batch; a batch-tagged one does not; /s
     backend.close();
   }
 });
+
+test("a request too big for one backend's context is routed to the one that can hold it", async () => {
+  const mk = async (tag) => {
+    const s = http.createServer((req, res) => { req.resume(); req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ tag })); }); });
+    await new Promise((r) => s.listen(0, "127.0.0.1", r));
+    return s;
+  };
+  const big = await mk("big"), small = await mk("small");
+  const cfg = { backends: { big: `http://127.0.0.1:${big.address().port}`, small: `http://127.0.0.1:${small.address().port}` }, waitTimeoutMs: 200, firstByteTimeoutMs: 1000, nonStreamTimeoutMs: 1000, idleTimeoutMs: 1000, idleWindowMs: 50 };
+  const pool = new Pool(["big", "small"], 2);
+  pool.applyPoll("big", { models: ["m"], loaded: ["m"], slots: { m: 1 }, ctx: { m: 98304 } });
+  pool.applyPoll("small", { models: ["m"], loaded: ["m"], slots: { m: 4 }, ctx: { m: 1000 } });
+  const server = createServer({ cfg, pool, leaser: new Leaser(pool), queue: new Queue(":memory:"), drainer: { current: null } });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    assert.deepStrictEqual(await (await post(`${base}/v1/chat/completions`, { model: "m", messages: [{ role: "user", content: "hi" }] })).json(), { tag: "small" });
+    const long = "x".repeat(20000);
+    assert.deepStrictEqual(await (await post(`${base}/v1/chat/completions`, { model: "m", messages: [{ role: "user", content: long }] })).json(), { tag: "big" });
+  } finally {
+    server.close(); big.close(); small.close();
+  }
+});

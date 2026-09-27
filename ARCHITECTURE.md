@@ -101,9 +101,13 @@ Two CLIs ship alongside it:
 - `startDiscovery()` polls every backend's `/v1/models` in parallel every
   `POLL_MS`, skipping a tick if the previous one is still in flight.
 - On llama-swap, it also polls `/running` for the currently-loaded model and
-  caches `/upstream/<model>/slots` per model **forever** once fetched —
-  re-fetching it on every poll would itself trigger a model load on
-  llama-swap, which is the exact bug the cache avoids. Ollama backends have
+  caches `/upstream/<model>/slots` (slot count + min per-slot `n_ctx`) per
+  model, keyed on the model's launch `cmd` from `/running` — fetched only while
+  the model is ready (fetching it for a non-resident model would itself
+  trigger a load on llama-swap), and re-fetched only when the cmd changes
+  (someone edited `--parallel`/`--ctx-size`). Cached values keep being
+  reported while the model is unloaded, so `pickBackend` can still skip a
+  backend whose context is too small for a request. Ollama backends have
   no `/running`; `loaded` stays `null` for them (capacity always known)
   rather than `[]` (would read as "loaded nothing").
 - A successful poll is the only thing that can shrink "models we don't yet
@@ -116,6 +120,12 @@ Two CLIs ship alongside it:
 
 ## Key decisions
 
+- **Route by context size, pessimistically.** `estimateTokens` (JSON chars ÷ 3,
+  tools included) over-estimates on purpose: too high just prefers the
+  bigger-context backend; too low sends the request somewhere that returns
+  HTTP 400 (this happened: Hermes's 25k-token turns landed on a 16k mac). An
+  unknown context is assumed to fit; if nothing is known to fit, the largest
+  is tried and the backend has the final word.
 - **Zero npm dependencies.** Only Node core modules (`node:sqlite`,
   `node:http`/`https`, global `fetch`) — CI reflects this (`node --check`,
   no install step) plus `node --test` for the actual unit tests.

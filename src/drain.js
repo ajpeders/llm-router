@@ -1,5 +1,6 @@
 "use strict";
 const { callJson } = require("./upstream");
+const { estimateTokens } = require("./pick");
 
 function chooseModel(pending, now, oldestOverrideMs) {
   if (pending.length === 0) return null;
@@ -54,9 +55,13 @@ class Drainer {
     if (!this.current) return;
 
     for (;;) {
+      // Size the backend to the job that claim() is about to hand out (same query,
+      // no await in between, so peek and claim see the same row).
+      const next = this.queue.peek(this.current, now);
+      if (!next) return;
       let backend;
       try {
-        backend = this.leaser.tryAcquire(this.current, "batch", { interactiveIdle });
+        backend = this.leaser.tryAcquire(this.current, "batch", { interactiveIdle, needCtx: estimateTokens(next.request) });
       } catch {
         return; // no backend serves it right now
       }

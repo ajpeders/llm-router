@@ -1,6 +1,7 @@
 "use strict";
 const http = require("node:http");
 const { proxyStream } = require("./upstream");
+const { estimateTokens } = require("./pick");
 const { createIdleTracker } = require("./idle");
 
 function send(res, status, obj) {
@@ -100,7 +101,7 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now, idleT
           const firstByteTimeoutMs = isStreaming ? cfg.firstByteTimeoutMs : cfg.nonStreamTimeoutMs;
           let backend;
           try {
-            backend = await leaser.acquire(model, "interactive", cfg.waitTimeoutMs);
+            backend = await leaser.acquire(model, "interactive", cfg.waitTimeoutMs, { needCtx: estimateTokens(parsedBody) });
           } catch (err) {
             if (err.message === "no_backend") {
               // "No up backend serves it" is ambiguous between "this model doesn't

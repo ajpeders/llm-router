@@ -83,3 +83,18 @@ test("2-slot model: batch uses every slot while idle, keeps one back otherwise",
   assert.deepStrictEqual(pickBackend(p, "small", "batch", { interactiveIdle: false }), { wait: true });
   assert.strictEqual(p.batchServable("small", false), true);
 });
+
+test("context size: skips backends too small for the request, falls back to the largest", () => {
+  const p = new Pool(["luna", "mac"], 2);
+  p.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 1 }, ctx: { m: 98304 } });
+  p.applyPoll("mac", { models: ["m"], loaded: ["m"], slots: { m: 2 }, ctx: { m: 16384 } });
+  assert.deepStrictEqual(pickBackend(p, "m", "interactive", { needCtx: 1000 }), { backend: "mac" }, "small: most free slots wins");
+  assert.deepStrictEqual(pickBackend(p, "m", "interactive", { needCtx: 30000 }), { backend: "luna" });
+  p.acquire("luna", "m");
+  assert.deepStrictEqual(pickBackend(p, "m", "interactive", { needCtx: 30000 }), { wait: true }, "waits for luna rather than a 400 from mac");
+  assert.deepStrictEqual(pickBackend(p, "m", "interactive", { needCtx: 200000 }), { wait: true }, "nothing fits: largest (luna) only");
+  const q = new Pool(["luna", "mac"], 2);
+  q.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: {}, ctx: { m: 16384 } });
+  q.applyPoll("mac", { models: ["m"], loaded: ["m"], slots: {}, ctx: {} });
+  assert.deepStrictEqual(pickBackend(q, "m", "interactive", { needCtx: 30000 }), { backend: "mac" }, "unknown context is kept");
+});

@@ -12,14 +12,34 @@ test("llama-swap backend: models, loaded, slot counts", async () => {
   const f = fakeFetch({
     [`${U}/v1/models`]: { data: [{ id: "big" }, { id: "small" }] },
     [`${U}/running`]: { running: [{ model: "small", state: "ready" }, { model: "big", state: "starting" }] },
-    [`${U}/upstream/small/slots`]: [{}, {}, {}, {}],
+    [`${U}/upstream/small/slots`]: [{ n_ctx: 8192 }, { n_ctx: 8192 }, { n_ctx: 8192 }, { n_ctx: 8192 }],
   });
-  assert.deepStrictEqual(await pollBackend(U, f), { models: ["big", "small"], loaded: ["small"], slots: { small: 4 } });
+  assert.deepStrictEqual(await pollBackend(U, f), { models: ["big", "small"], loaded: ["small"], slots: { small: 4 }, ctx: { small: 8192 } });
+});
+
+test("slot count + context are re-fetched when the model's launch cmd changes, kept while unloaded", async () => {
+  let running = [{ model: "m", state: "ready", cmd: "llama-server -c 16384 --parallel 2" }];
+  let slots = [{ n_ctx: 8192 }, { n_ctx: 8192 }];
+  const f = async (url) => {
+    if (url === `${U}/v1/models`) return { data: [{ id: "m" }] };
+    if (url === `${U}/running`) return { running };
+    if (url === `${U}/upstream/m/slots`) return slots;
+    throw new Error("404");
+  };
+  const cache = new Map();
+  assert.deepStrictEqual((await pollBackend(U, f, cache)).ctx, { m: 8192 });
+  running = [{ model: "m", state: "ready", cmd: "llama-server -c 65536 --parallel 1" }];
+  slots = [{ n_ctx: 65536 }];
+  const r = await pollBackend(U, f, cache);
+  assert.deepStrictEqual([r.slots, r.ctx], [{ m: 1 }, { m: 65536 }]);
+  running = []; // unloaded: last known values still reported
+  const u = await pollBackend(U, f, cache);
+  assert.deepStrictEqual([u.loaded, u.slots, u.ctx], [[], { m: 1 }, { m: 65536 }]);
 });
 
 test("Ollama backend: no /running → loaded null", async () => {
   const f = fakeFetch({ [`${U}/v1/models`]: { data: [{ id: "m" }] } });
-  assert.deepStrictEqual(await pollBackend(U, f), { models: ["m"], loaded: null, slots: {} });
+  assert.deepStrictEqual(await pollBackend(U, f), { models: ["m"], loaded: null, slots: {}, ctx: {} });
 });
 
 test("a pollOnce already in flight skips a second overlapping call", async () => {

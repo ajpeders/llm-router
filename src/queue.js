@@ -62,11 +62,16 @@ class Queue {
       .map((r) => ({ model: r.model, count: r.count, oldest: r.oldest }));
   }
 
-  claim(model, now) {
-    const r = this.db
-      .prepare(`SELECT id FROM jobs WHERE status = 'pending' AND model = ? AND next_run_at <= ?
+  // The job claim() would return next, without claiming it.
+  peek(model, now) {
+    return row(this.db
+      .prepare(`SELECT * FROM jobs WHERE status = 'pending' AND model = ? AND next_run_at <= ?
                 ORDER BY priority DESC, created_at ASC LIMIT 1`)
-      .get(model, now);
+      .get(model, now));
+  }
+
+  claim(model, now) {
+    const r = this.peek(model, now);
     if (!r) return null;
     this.db
       .prepare("UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ?")
