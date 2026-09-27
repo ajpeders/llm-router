@@ -7,16 +7,21 @@ const { Drainer, makeRunJob } = require("./src/drain");
 const { startDiscovery } = require("./src/discovery");
 const { deliverCallback, alertDead } = require("./src/notify");
 const { createServer } = require("./src/server");
+const { createIdleTracker } = require("./src/idle");
 
 const cfg = loadConfig();
 const pool = new Pool(Object.keys(cfg.backends), cfg.defaultSlots);
 const leaser = new Leaser(pool);
 const queue = new Queue(cfg.dbPath);
 const recovered = queue.recoverRunning(Date.now());
+// Shared: the server records interactive traffic, the drainer reads it to decide
+// whether batch may use a 1-slot model's only slot.
+const idleTracker = createIdleTracker(cfg.idleWindowMs);
 
 const drainer = new Drainer({
   queue, leaser, pool, cfg,
   runJob: makeRunJob(cfg),
+  isInteractiveIdle: () => idleTracker.snapshot(Date.now()).idle,
   onFinished: async (job) => {
     await deliverCallback(job);
     if (job.status === "dead") await alertDead(job, cfg);
@@ -24,7 +29,7 @@ const drainer = new Drainer({
 });
 
 const discovery = startDiscovery({ cfg, pool, leaser });
-const server = createServer({ cfg, pool, leaser, queue, drainer });
+const server = createServer({ cfg, pool, leaser, queue, drainer, idleTracker });
 
 server.listen(cfg.port, "0.0.0.0", async () => {
   console.log(`[llm-router] listening :${cfg.port}; backends ${JSON.stringify(cfg.backends)}; recovered ${recovered} running job(s)`);

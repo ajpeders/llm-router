@@ -289,3 +289,23 @@ test("a malformed request target (\"//\") is handled, not an unhandled rejection
   assert.strictEqual((await fetch(`${s.base}/health`)).status, 200);
   s.close();
 });
+
+test("uses an injected idle tracker, so the drainer sees the same interactive traffic", async () => {
+  const { createIdleTracker } = require("../src/idle");
+  const s = await (async () => {
+    const backend = http.createServer((req, res) => { req.resume(); req.on("end", () => { res.writeHead(200); res.end("{}"); }); });
+    await new Promise((r) => backend.listen(0, "127.0.0.1", r));
+    const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 200, firstByteTimeoutMs: 1000, nonStreamTimeoutMs: 1000, idleTimeoutMs: 1000, idleWindowMs: 50 };
+    const pool = new Pool(["luna"], 2);
+    pool.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 1 } });
+    const idleTracker = createIdleTracker(50);
+    const server = createServer({ cfg, pool, leaser: new Leaser(pool), queue: new Queue(":memory:"), drainer: { current: null }, now: () => 1000, idleTracker });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    return { base: `http://127.0.0.1:${server.address().port}`, idleTracker, close: () => { server.close(); backend.close(); } };
+  })();
+  assert.strictEqual(s.idleTracker.snapshot(1000).idle, true);
+  await post(`${s.base}/v1/chat/completions`, { model: "m", messages: [] });
+  assert.strictEqual(s.idleTracker.snapshot(1000).idle, false, "interactive request marked the shared tracker");
+  assert.strictEqual(s.idleTracker.snapshot(1100).idle, true);
+  s.close();
+});

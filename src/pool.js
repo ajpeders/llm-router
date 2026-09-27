@@ -1,4 +1,5 @@
 "use strict";
+const { batchReserve } = require("./pick");
 
 class Pool {
   constructor(names, defaultSlots, now = Date.now) {
@@ -72,12 +73,14 @@ class Pool {
     return [...all].sort();
   }
 
-  // Whether the batch lane (which always reserves 1 slot) can ever get a slot for this
-  // model on some up backend. Structural only — ignores current inflight, so a model
-  // that's merely busy right now still counts, but one with only 1 total slot never does.
-  batchServable(model) {
+  // Whether the batch lane can currently get a slot for this model on some up backend,
+  // under pickBackend's reserve rule. Structural only — ignores current inflight, so a
+  // model that's merely busy right now still counts. A 1-slot model counts only while
+  // the interactive lane is idle.
+  batchServable(model, interactiveIdle = false) {
     for (const b of this.backends.values()) {
-      if (b.up && b.models.has(model) && this.capacity(b, model) - 1 > 0) return true;
+      const cap = this.capacity(b, model);
+      if (b.up && b.models.has(model) && cap - batchReserve(cap, "batch", { interactiveIdle }) > 0) return true;
     }
     return false;
   }

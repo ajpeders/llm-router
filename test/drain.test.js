@@ -6,6 +6,7 @@ const { chooseModel, Drainer, makeRunJob } = require("../src/drain");
 const { Queue } = require("../src/queue");
 const { Pool } = require("../src/pool");
 const { Leaser } = require("../src/lease");
+const { createIdleTracker } = require("../src/idle");
 
 const cfg = { oldestOverrideMs: 30 * 60000, drainMaxMs: 10 * 60000, retryDelaysMs: [0, 0, 0] };
 
@@ -152,4 +153,51 @@ test("onFinished throwing does not crash the process; job stays done, slot relea
   assert.strictEqual(unhandled, null, "a throwing onFinished must not produce an unhandled rejection");
   assert.strictEqual(queue.get(id).status, "done");
   assert.strictEqual(pool.totalInflight(pool.backends.get("luna")), 0);
+});
+
+test("1-slot model drains only while the interactive lane is idle", async () => {
+  const pool = new Pool(["luna"], 2);
+  pool.applyPoll("luna", { models: ["A"], loaded: ["A"], slots: { A: 1 } });
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  queue.submit({ model: "A", request: {} }, 0);
+  let idle = false;
+  const d = new Drainer({
+    queue, leaser, pool, cfg, runJob: async () => ({}), onFinished: async () => {}, now: () => 1,
+    isInteractiveIdle: () => idle,
+  });
+  d.tick(); await d.idle();
+  assert.strictEqual(queue.counts().pending, 1, "not idle: 1-slot job must wait");
+  idle = true;
+  d.tick(); await d.idle();
+  assert.strictEqual(queue.counts().done, 1, "idle: 1-slot job runs");
+});
+
+test("integration: interactive traffic holds a 1-slot batch job until the idle window passes", async () => {
+  let t = 10000;
+  const tracker = createIdleTracker(100);
+  const pool = new Pool(["luna"], 2);
+  pool.applyPoll("luna", { models: ["A"], loaded: ["A"], slots: { A: 1 } });
+  const leaser = new Leaser(pool);
+  const queue = new Queue(":memory:");
+  const id = queue.submit({ model: "A", request: {} }, 0).id;
+  const d = new Drainer({
+    queue, leaser, pool, cfg, runJob: async () => ({}), onFinished: async () => {}, now: () => t,
+    isInteractiveIdle: () => tracker.snapshot(t).idle,
+  });
+
+  // An interactive request (as the server records it) holds the model's only slot.
+  tracker.begin(); tracker.markActivity(t);
+  const h = leaser.tryAcquire("A", "interactive");
+  d.tick(); await d.idle();
+  assert.strictEqual(queue.get(id).status, "pending", "in flight: batch waits");
+
+  leaser.release(h, "A"); tracker.end();
+  t += 50;
+  d.tick(); await d.idle();
+  assert.strictEqual(queue.get(id).status, "pending", "inside the quiet window: batch still waits");
+
+  t += 100;
+  d.tick(); await d.idle();
+  assert.strictEqual(queue.get(id).status, "done", "after the window: batch runs");
 });

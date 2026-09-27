@@ -7,8 +7,8 @@ class Leaser {
     this.waiters = [];
   }
 
-  tryAcquire(model, lane) {
-    const r = pickBackend(this.pool, model, lane);
+  tryAcquire(model, lane, opts = {}) {
+    const r = pickBackend(this.pool, model, lane, opts);
     if (r.none) throw new Error("no_backend");
     if (r.wait) return null;
     this.pool.acquire(r.backend, model);

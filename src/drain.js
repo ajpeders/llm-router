@@ -10,8 +10,8 @@ function chooseModel(pending, now, oldestOverrideMs) {
 
 // Drains one model at a time so a big model loads once per drain, not once per job.
 class Drainer {
-  constructor({ queue, leaser, pool, cfg, runJob, onFinished, now = Date.now }) {
-    Object.assign(this, { queue, leaser, pool, cfg, runJob, onFinished, now });
+  constructor({ queue, leaser, pool, cfg, runJob, onFinished, now = Date.now, isInteractiveIdle = () => false }) {
+    Object.assign(this, { queue, leaser, pool, cfg, runJob, onFinished, now, isInteractiveIdle });
     this.current = null;
     this.drainStart = 0;
     this.running = new Set();
@@ -20,11 +20,11 @@ class Drainer {
   tick() {
     if (this.leaser.interactiveWaiting) return;
     const now = this.now();
-    // Only models the batch lane can ever get a slot for (structurally, ignoring
-    // current inflight) — a 1-slot model would otherwise park the drainer on it
-    // forever, since tryAcquire can never succeed for it. Jobs for such a model
-    // simply stay pending.
-    const pending = this.queue.pendingByModel(now).filter((p) => this.pool.batchServable(p.model));
+    // Only models the batch lane can get a slot for right now (structurally, ignoring
+    // current inflight). A 1-slot model qualifies only while the interactive lane is
+    // idle; otherwise it would park the drainer on a model tryAcquire can't serve.
+    const interactiveIdle = this.isInteractiveIdle();
+    const pending = this.queue.pendingByModel(now).filter((p) => this.pool.batchServable(p.model, interactiveIdle));
 
     const hasCurrent = this.current && pending.some((p) => p.model === this.current);
     if (!hasCurrent || now - this.drainStart >= this.cfg.drainMaxMs) {
@@ -44,7 +44,7 @@ class Drainer {
     for (;;) {
       let backend;
       try {
-        backend = this.leaser.tryAcquire(this.current, "batch");
+        backend = this.leaser.tryAcquire(this.current, "batch", { interactiveIdle });
       } catch {
         return; // no backend serves it right now
       }

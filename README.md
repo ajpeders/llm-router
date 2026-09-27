@@ -64,6 +64,14 @@ duration. Batch traffic goes through `/jobs`, is persisted to SQLite
 (`src/drain.js`) so a big model loads once per drain window, not once per
 job.
 
+The batch lane keeps one slot per backend and model free for interactive
+traffic, so it uses at most capacity − 1. The one exception is a model with
+exactly **1** slot (luna's big models run `--parallel 1`): batch may take that
+single slot, but only while the interactive lane is idle (no interactive
+`/v1` request in flight and none within `IDLE_WINDOW_MS`, as reported by
+`/idle`). The cost is that an interactive request arriving mid-job waits for
+that batch job to finish (up to `WAIT_TIMEOUT_MS`, then 503).
+
 ### API
 
 ```bash

@@ -61,3 +61,25 @@ test("downSince is set on failure and cleared on recovery", () => {
   for (let i = 0; i < 3; i++) p.applyFailure("a", 3);
   assert.strictEqual(p.backends.get("a").downSince, 2000);
 });
+
+test("1-slot model: batch takes the only slot while interactive is idle, waits otherwise", () => {
+  const p = new Pool(["luna"], 2);
+  p.applyPoll("luna", { models: ["big"], loaded: ["big"], slots: { big: 1 } });
+  assert.deepStrictEqual(pickBackend(p, "big", "batch", { interactiveIdle: true }), { backend: "luna" });
+  assert.deepStrictEqual(pickBackend(p, "big", "batch", { interactiveIdle: false }), { wait: true });
+  assert.deepStrictEqual(pickBackend(p, "big", "batch"), { wait: true });
+  // Unloaded on an idle backend: same rule applies to the load path.
+  const q = new Pool(["luna"], 2);
+  q.applyPoll("luna", { models: ["big"], loaded: [], slots: { big: 1 } });
+  assert.deepStrictEqual(pickBackend(q, "big", "batch", { interactiveIdle: false }), { wait: true });
+  assert.deepStrictEqual(pickBackend(q, "big", "batch", { interactiveIdle: true }), { backend: "luna" });
+});
+
+test("2-slot model: batch still keeps one slot back even when interactive is idle", () => {
+  const p = new Pool(["mac"], 2);
+  p.applyPoll("mac", { models: ["small"], loaded: ["small"], slots: { small: 2 } });
+  assert.deepStrictEqual(pickBackend(p, "small", "batch", { interactiveIdle: true }), { backend: "mac" });
+  p.acquire("mac", "small");
+  assert.deepStrictEqual(pickBackend(p, "small", "batch", { interactiveIdle: true }), { wait: true });
+  assert.strictEqual(p.batchServable("small", false), true);
+});

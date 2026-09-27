@@ -21,12 +21,13 @@ function parseJson(buf) {
   try { return JSON.parse(buf.toString("utf8") || "null"); } catch { return null; }
 }
 
-function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now }) {
+function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now, idleTracker }) {
   // Interactive-lane idle tracker: batch jobs run through the drainer, never through
   // this server, so they're excluded automatically. A request tagged
   // x-llm-router-batch: 1 is excluded explicitly (used by callers that hit /v1
-  // directly for batch-shaped work outside the queue).
-  const idleTracker = createIdleTracker(cfg.idleWindowMs ?? 120000);
+  // directly for batch-shaped work outside the queue). router.js injects a shared
+  // tracker so the drainer can see the same idle state.
+  idleTracker ??= createIdleTracker(cfg.idleWindowMs ?? 120000);
 
   return http.createServer(async (req, res) => {
     try {
