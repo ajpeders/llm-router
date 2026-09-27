@@ -32,7 +32,7 @@ node router.js
 | `NONSTREAM_TIMEOUT_MS` | `1800000` | Interactive-lane timeout for a request with `stream != true` — its headers only arrive once generation is fully done, so it needs the same long cap as a batch job |
 | `IDLE_TIMEOUT_MS` | `60000` | Stream idle timeout (interactive and batch) |
 | `IDLE_WINDOW_MS` | `120000` | Quiet window with no real requests before `/idle` reports idle |
-| `BATCH_HOLDOFF_MS` | `1800000` | Batch is paused while any interactive `/v1` request is in flight and until this long after the last one |
+| `BATCH_HOLDOFF_MS` | `600000` | Batch is paused while any interactive `/v1` request is in flight and until this long after the last one |
 | `BATCH_TIMEOUT_MS` | `1800000` | Total cap for a batch job's run (non-streaming, so this is the real ceiling) |
 | `WAIT_TIMEOUT_MS` | `600000` | How long an interactive request waits for a free slot before failing |
 | `DB_PATH` | `/data/jobs.db` | SQLite path for the job queue |
@@ -68,7 +68,7 @@ job.
 **Interactive always wins.** Batch jobs queue up and wait while no backend
 can serve their model, and run once one can — but only while the
 interactive lane is quiet: no interactive `/v1` request in flight and none
-within `BATCH_HOLDOFF_MS` (default 30 min). While quiet, batch may use every
+within `BATCH_HOLDOFF_MS` (default 10 min). While quiet, batch may use every
 slot, including a 1-slot model's only one. An interactive request arriving
 mid-batch **preempts** it: every running batch job is aborted and requeued
 as `pending` (the aborted run doesn't count toward its retries), the request

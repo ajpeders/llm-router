@@ -118,7 +118,7 @@ POSTed back instead of polling.
 
 Have it `POST /jobs` as above — submitting never waits on or disturbs the
 interactive lane. Jobs run when their model is servable and nobody has made
-an interactive `/v1` request for `BATCH_HOLDOFF_MS` (30 min by default); your
+an interactive `/v1` request for `BATCH_HOLDOFF_MS` (10 min by default); your
 own interactive requests abort running jobs and requeue them. Check whether
 batch is currently held off:
 

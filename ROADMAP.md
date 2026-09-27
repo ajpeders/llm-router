@@ -9,7 +9,7 @@
   queue.
 
 - [x] Interactive preempts batch (2026-09-27): batch pauses while
-  interactive `/v1` traffic is active and for `BATCH_HOLDOFF_MS` (30 min)
+  interactive `/v1` traffic is active and for `BATCH_HOLDOFF_MS` (10 min)
   after it; running jobs are aborted and requeued without burning an attempt.
   Batch may now use every slot (incl. 1-slot models) while quiet.
 
