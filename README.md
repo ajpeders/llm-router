@@ -33,6 +33,7 @@ node router.js
 | `IDLE_TIMEOUT_MS` | `60000` | Stream idle timeout (interactive and batch) |
 | `IDLE_WINDOW_MS` | `120000` | Quiet window with no real requests before `/idle` reports idle |
 | `BATCH_HOLDOFF_MS` | `600000` | Batch is paused while any interactive `/v1` request is in flight and until this long after the last one |
+| `BACKGROUND_SOURCES` | `kanban,cron` | `x-llm-router-source` header values whose `/v1` traffic is background work — treated like `x-llm-router-batch: 1` |
 | `BATCH_TIMEOUT_MS` | `1800000` | Total cap for a batch job's run (non-streaming, so this is the real ceiling) |
 | `WAIT_TIMEOUT_MS` | `600000` | How long an interactive request waits for a free slot before failing |
 | `DB_PATH` | `/data/jobs.db` | SQLite path for the job queue |
@@ -88,7 +89,13 @@ reports `batch_paused`.
 
 Automation that submits `/jobs` (e.g. Hermes) never pauses the queue. If it
 also calls `/v1/*` directly for work that isn't urgent, tag those calls
-`x-llm-router-batch: 1` so they don't count as interactive either.
+`x-llm-router-batch: 1` — or send `x-llm-router-source: <name>` with a name
+listed in `BACKGROUND_SOURCES` — so they don't count as interactive either.
+Hermes does the latter: its config sends
+`x-llm-router-source: ${HERMES_SESSION_SOURCE}`, which is `kanban` inside a
+task-board worker and an unexpanded placeholder in a chat, so its autonomous
+workers are background and your chats with it are interactive. Tagged `/v1`
+calls still use the interactive lane for slots; they just don't pause batch.
 
 ### API
 

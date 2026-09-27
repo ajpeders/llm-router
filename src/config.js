@@ -40,6 +40,10 @@ function loadConfig(env = process.env) {
     // Batch is paused while any interactive request is in flight and until this long
     // after the last one, so a coding session isn't interleaved with batch jobs.
     batchHoldoffMs: int(env, "BATCH_HOLDOFF_MS", 10 * 60000),
+    // x-llm-router-source values whose /v1 traffic is background work (an agent's
+    // own task runner, cron), treated like x-llm-router-batch: 1 — it neither
+    // pauses nor preempts batch. Everything else is a person, i.e. interactive.
+    backgroundSources: (env.BACKGROUND_SOURCES ?? "kanban,cron").split(",").map((s) => s.trim()).filter(Boolean),
     waitTimeoutMs: int(env, "WAIT_TIMEOUT_MS", 600000),
     dbPath: env.DB_PATH || "/data/jobs.db",
     oldestOverrideMs: int(env, "OLDEST_OVERRIDE_MS", 30 * 60000),

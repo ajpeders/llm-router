@@ -80,7 +80,8 @@ function createServer({ cfg, pool, leaser, queue, drainer, now = Date.now, idleT
         return job ? send(res, 200, job) : send(res, 404, { error: "not_found" });
       }
       if (path.startsWith("/v1/")) {
-        const isBatch = req.headers["x-llm-router-batch"] === "1";
+        const isBatch = req.headers["x-llm-router-batch"] === "1" ||
+          (cfg.backgroundSources ?? []).includes(req.headers["x-llm-router-source"]);
         if (!isBatch) {
           idleTracker.begin();
           idleTracker.markActivity(now());

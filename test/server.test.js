@@ -313,7 +313,7 @@ test("uses an injected idle tracker, so the drainer sees the same interactive tr
 test("an interactive /v1 request preempts batch; a batch-tagged one does not; /status shows the pause", async () => {
   const backend = http.createServer((req, res) => { req.resume(); req.on("end", () => { res.writeHead(200, { "content-type": "application/json" }); res.end("{}"); }); });
   await new Promise((r) => backend.listen(0, "127.0.0.1", r));
-  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 200, firstByteTimeoutMs: 1000, nonStreamTimeoutMs: 1000, idleTimeoutMs: 1000, idleWindowMs: 50 };
+  const cfg = { backends: { luna: `http://127.0.0.1:${backend.address().port}` }, waitTimeoutMs: 200, firstByteTimeoutMs: 1000, nonStreamTimeoutMs: 1000, idleTimeoutMs: 1000, idleWindowMs: 50, backgroundSources: ["kanban", "cron"] };
   const pool = new Pool(["luna"], 2);
   pool.applyPoll("luna", { models: ["m"], loaded: ["m"], slots: { m: 2 } });
   let preempts = 0;
@@ -324,8 +324,13 @@ test("an interactive /v1 request preempts batch; a batch-tagged one does not; /s
   try {
     await fetch(`${base}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-llm-router-batch": "1" }, body: JSON.stringify({ model: "m" }) });
     assert.strictEqual(preempts, 0, "batch-tagged traffic (e.g. Hermes automation) must not pause the queue");
+    const asSource = (src) => fetch(`${base}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json", "x-llm-router-source": src }, body: JSON.stringify({ model: "m" }) });
+    await asSource("kanban");
+    assert.strictEqual(preempts, 0, "a listed background source (Hermes kanban worker) must not pause the queue");
+    await asSource("${HERMES_SESSION_SOURCE}"); // Hermes chat: env var unset, placeholder sent verbatim
+    assert.strictEqual(preempts, 1, "an unlisted source is a person");
     await post(`${base}/v1/chat/completions`, { model: "m" });
-    assert.strictEqual(preempts, 1);
+    assert.strictEqual(preempts, 2);
     assert.strictEqual((await (await fetch(`${base}/status`)).json()).batch_paused, true);
   } finally {
     server.close();

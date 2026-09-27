@@ -18,6 +18,10 @@ test("defaults match the spec", () => {
   assert.strictEqual(c.oldestOverrideMs, 30 * 60000);
   assert.strictEqual(c.drainMaxMs, 10 * 60000);
   assert.deepStrictEqual(c.retryDelaysMs, [30000, 120000, 600000]);
+  assert.strictEqual(c.batchHoldoffMs, 10 * 60000);
+  assert.deepStrictEqual(c.backgroundSources, ["kanban", "cron"]);
+  assert.deepStrictEqual(loadConfig({ BACKENDS_JSON: B, BACKGROUND_SOURCES: " a, b ,," }).backgroundSources, ["a", "b"]);
+  assert.deepStrictEqual(loadConfig({ BACKENDS_JSON: B, BACKGROUND_SOURCES: "" }).backgroundSources, []);
   assert.strictEqual(c.doneRetentionMs, 7 * 86400000);
   assert.strictEqual(c.dbPath, "/data/jobs.db");
 });

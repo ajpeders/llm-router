@@ -127,8 +127,15 @@ curl -s http://localhost:8080/status | grep -o '"batch_paused":[a-z]*'
 ```
 
 If the agent also calls `/v1/*` directly for background work, send
-`x-llm-router-batch: 1` on those calls, or they will pause the queue like
-your own requests do.
+`x-llm-router-batch: 1` (or `x-llm-router-source: <a BACKGROUND_SOURCES
+name>`) on those calls, or they will pause the queue like your own requests
+do. Hermes is set up this way in `~/.hermes/config.yaml`:
+
+```yaml
+model:
+  extra_headers:
+    x-llm-router-source: ${HERMES_SESSION_SOURCE}   # "kanban" in task-board workers
+```
 
 ## Diagnose a backend that isn't receiving traffic
 
